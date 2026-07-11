@@ -176,6 +176,21 @@ Packaging note: submissions must use **folder mode** (`whest package/submit
 --estimator . --yes`) so `points.npz` ships; the kit's `.gitignore` had a
 `*.npz` rule that silently excluded it (removed).
 
+## v2 leaderboard result (public split, 50 MLPs)
+
+- **Adjusted score 3.783e-7** — **1.7× better than the MC reference (6.47e-7)**;
+  v1 → v2 = 6.53e-7 → 3.78e-7 (1.73×). 0/50 failures, utilization 9.75%.
+- Tail improved more than the mean: worst MLP 2.58e-6 → 1.19e-6 (2.2×), IQR
+  down ~30% — better-spread points help exactly the high-variance MLPs.
+- Public raw final-layer MSE 3.78e-6 vs mini split 4.28e-6 vs local 8-seed
+  2.65e-6: local seeds flatter systematically; the mini split is the honest
+  predictor.
+- Error no longer grows with depth (L0→L31 growth 0.85×) — sampling error
+  tracks the decaying activation variance; steepest layer is L1, hinting
+  early-layer point geometry is where uniformity matters most.
+- Utilization margin is thin (9.75% vs 10% floor): trim `_BUDGET_FRACTION`
+  slightly in v3 (≈0.0965) — ~50 fewer samples is negligible vs floor risk.
+
 ---
 
 # Strategy: how to win (deep-dive, 2026-07-11 evening)
@@ -205,6 +220,34 @@ Packaging note: submissions must use **folder mode** (`whest package/submit
   with depth). Deep-net fluctuations across inputs are low-effective-dimension.
 - **Wu & Hilton LPE (ICLR 2025)**: importance sampling > activation
   extrapolation — tail-specific, not directly transferable to mean estimation.
+- **Challenge announcement (alignment.org, June 2026)**: ARC states their
+  methods "break down as the depth grows" and are "very confident" they can be
+  significantly improved. **Any method is allowed, white- or black-box** —
+  sampling-based approaches are explicitly legal; the only ban is
+  circumventing the FLOP counter (our shipped-points pattern is the
+  starterkit's own documented mechanism). Prize pool ≥ $100k with a **second
+  prize track for algorithmic contributions in technical reports** — this
+  document doubles as that report. LLM-assisted work is explicitly encouraged.
+- **"Mechanistic estimation for expectations of random products"
+  (alignment.org, May 2026)** — ARC's newest framework and their own answer to
+  "keep more information only where it's valuable": **deduction–projection
+  estimators** alternate exact computation steps with complexity-reducing
+  projections, and **mechanistic L² sketching** projects the intermediate
+  representation onto the top eigenfunctions of a (learned) kernel. Results so
+  far: matches sampling up to log factors on random halfspace intersections /
+  #3-SAT / permanents — but **only single-layer** so far; no depth analysis.
+  For depth-32 MLPs this is the theoretically right replacement for cumulant
+  truncation (project onto what matters for the *tail* of the computation,
+  instead of keeping a fixed cumulant order everywhere) — a research-project-
+  sized lift, not a weekend patch.
+- **"A Mike's-Eye View of ARC's Research" (June 2026)**: formal MSP statement
+  ("for any architecture and precision there is a mechanistic estimator that
+  at least matches sampling over random instances"); confirms cumulant
+  propagation is ARC's best current MLP result; structure-vs-randomness and
+  training-trajectory advice are the longer-term picture.
+- **"Obstacles in ARC's research agenda" (May 2025)**: the three named
+  obstacles (finding explanations, mechanistic anomaly detection, low
+  probability estimation) — background, no algorithmic content for this task.
 
 ## The scoring math (what actually matters)
 
@@ -258,9 +301,19 @@ ridge toward uniform 1/N and by the huge effective sample count
 
 ## Ranked plan
 
-1. **Learned quadrature weights** (offline ridge on ~300 MLPs) — in progress.
-2. **Learned/optimized point set** (SGD through the same objective, init at
-   Sobol-mm) — second-order refinement once weights plateau.
+1. **Learned quadrature weights** (offline ridge on 128 MLPs, 32 held-out).
+   *Result: rejected* — best learned weights 4.59e-6 vs uniform 4.64e-6 (<2%);
+   the ridge collapses to uniform and the mean-prop coefficient regresses to
+   exactly 0. Uniform weights on the Sobol-mm set are already ≈ the BQ optimum;
+   the residual error is per-MLP idiosyncratic (posterior variance), not
+   removable by static reweighting. Spherical projection: ~1% (kept anyway —
+   exact and free).
+2. **Learned/optimized point set** (in progress): SGD directly on the 6272×256
+   point matrix against the *true ensemble* — per step draw a fresh random MLP
+   and fresh Gaussian batch, unbiased loss ‖m_P‖² − 2⟨m_P, m_X⟩ (= quadrature
+   MSE + const), rows re-projected to the exact-radius sphere. Fresh MLP every
+   step ⇒ infinite training data, no overfitting channel; validated on 24
+   fixed MLPs with 2e6-sample ground truth.
 3. **Global-coefficient analytic fusion** inside the same regression (mean-prop
    / K=2 features with *offline-learned* fixed coefficients — per-MLP adaptive
    weighting already failed; global learned coefficients are the sound form).
@@ -271,3 +324,123 @@ ridge toward uniform 1/N and by the huge effective sample count
 5. Out-of-scope after measurement: K≥3 (budget), antithetic & linearized
    control variates (no odd/linear signal at depth 32), per-MLP adaptive
    fusion (bias detection noise = MC noise), running above the floor (β<1).
+
+## Research observations (full dump)
+
+### Structure of the problem at 256×32
+
+- **Signal decay:** final-layer activations have mean |μ| ≈ 0.23 and per-neuron
+  variance ≈ 0.012 (it decays with depth). Small variance is exactly why
+  sampling is strong at the final layer — and the final layer is all that's
+  scored.
+- **Per-MLP spread is huge:** final-layer variance varies ~25× across MLPs
+  (leaderboard: best MLP 9.75e-8, worst 2.58e-6; wanda-sanders-type MLPs
+  dominate the mean score). Any robustness gain on the worst tail moves the
+  leaderboard more than uniform improvement.
+- **No odd signal survives depth 32:** antithetic pairing gained ~nothing,
+  which also implies any control variate linear in x (e.g. J·x) is dead. The
+  output's dependence on the input is effectively even/nonlinear.
+- **Correlation collapse (Dunbar–Aaronson):** deep-net outputs are nearly
+  independent iff the activation has zero Gaussian mean; ReLU has positive
+  mean, so activations for two independent inputs become strongly correlated
+  with depth. Consequences: (a) the fluctuation across inputs is
+  low-effective-dimensional; (b) analytic layerwise methods accumulate error
+  (correlations are exactly what they truncate); (c) quadrature/QMC exploits
+  it — but its edge *decays* with N (measured β ≈ 0.83), because the
+  low-dimensional structure is exhausted by a few thousand well-spread points.
+- **Positive 1-homogeneity** (no biases): act(λx) = λ·act(x) for λ>0 ⇒
+  E[act] = E‖x‖ · E[act(u)] with E‖x‖ = √2·Γ(128.5)/Γ(128) exact. Radial
+  variance is only ~1% of the total at n=256 (chi concentration), but the
+  projection is free and exact, so we keep it.
+- **Ground truth is itself MC (N=1e9):** irreducible score floor ~1e-12;
+  irrelevant at our ~3e-7, but means "perfect" prediction is impossible and
+  the last ~1e-11 of MSE is noise-fitting.
+
+### Scoring-model exploits (all verified)
+
+- Compute below 10% of budget is free (multiplier floor 0.1) — the contest is
+  really "best estimator at 2.72e10 FLOPs". Exceeding the *full* budget zeroes
+  you with multiplier 1.0 — a 10× cliff; never sail close to 100%.
+- Only the final layer is ranked; all-layers MSE is a diagnostic.
+- `setup()` and shipped `.npz` files (`flopscope.Module`) are **off-budget** —
+  unlimited offline compute is legal and is the single most exploitable rule.
+  50 MiB / 50 file caps apply; `*.npz` was silently gitignore-excluded.
+- Residual wall-time counts: C = FLOPs + 1e11·R_m. Keep everything inside
+  flopscope kernels (batched matmuls); our measured R ≈ 0.3 ms/MLP.
+- RNG costs ~16 FLOPs/element — shipping fixed points avoids even that.
+- flopscope credits symmetric einsums (`fnp.einsum("ij,ia,jb->ab", cov, w, w)`)
+  — relevant only if analytic components return.
+
+### The kprop landscape at depth 32 (all measured, all excluded)
+
+- Depth scaling is the killer: MSE ~ c_K(L/n)^K grows as L^K (paper App. D);
+  the authors themselves flag depth-robust sample-free estimation as open.
+- Exact costs (paper Table 1): K=2 basic 7n³L ≈ 3.8e9 ✓ affordable, MSE
+  ~4.7e-5 avg (7× worse than QMC at floor). K=2 augmented 11n³L ≈ 5.9e9 —
+  numerically unstable at L=32 (MSE 6e-4 … 7e+3). Factorized K=3 30n³L²
+  ≈ 5.2e11 — over budget purely from the L² term (factor rank grows per
+  layer); plain K=3 also doesn't beat K=2's final-layer MSE at this depth.
+- Power cumulants are essential (ablation degrades O(1/n^K) → O(1)); any
+  reimplementation must keep them.
+- Repo's `symb/` note: whole-network tensor-network contraction with optimal
+  (non-layerwise) paths is asymptotically faster "but constants too large".
+
+### Statistical no-go results (measured, with the reason)
+
+- **Per-neuron fusion of MC + analytic cannot work at this budget:** the
+  per-neuron bias signal is (mc − analytic), whose detection noise *is* the MC
+  noise; even oracle per-neuron weights gave only 1.37×, realistic rules were
+  net negative. General principle: any per-MLP adaptive scheme must extract
+  its steering signal from the same sample budget, and at the floor that
+  signal is at the noise level.
+- **Learned static quadrature weights collapse to uniform** (<2% gain, ridge
+  pushes |w − 1/N| → 0; mean-prop feature coefficient → exactly 0): the
+  Sobol+moment-matched set is already ≈ BQ-optimal for the ensemble kernel.
+  Remaining error is per-MLP posterior variance — only *better points* (or a
+  fundamentally different information channel) can reduce it.
+- **β < 1 for QMC** ⇒ never leave the floor; iid MC has β = 1 exactly (score
+  flat in compute), so an estimator must have β > 1 before more compute helps.
+
+### Ideas considered, not yet exhausted (future work)
+
+- **Point-set optimization on the true ensemble** (running): SGD on the
+  6272×256 matrix, fresh MLP + fresh Gaussian batch per step (unbiased loss
+  ‖m_P‖² − 2⟨m_P, m_X⟩), spherical re-projection each step. No overfitting
+  channel by construction.
+- **Per-MLP point selection from a shipped dictionary:** ship k× more points,
+  select N at predict time with a cheap fixed rule using W statistics (e.g.
+  first-layer projections). Cheap (n² per point) but the deep composition, not
+  the first layer, drives the integrand — speculative.
+- **Multilevel depth telescoping:** E[f_L] = E[f_j] + E[f_L − f_j] with an
+  analytic tail from layer j; needs the tail to be cheaper than the true
+  continuation AND per-sample-correlated with it — no construction found yet
+  (given x_j the continuation is deterministic; any cheap tail is a smoothed
+  version whose per-sample residual is O(1)).
+- **Robust aggregation for the worst-MLP tail:** trimmed/winsorized weighted
+  means cost the same FLOPs; could trade a little average MSE for tail
+  robustness. Untested.
+- **Nonlinear readout:** a tiny offline-trained head g(sample statistics) →
+  correction. The linear version (weights) regressed to uniform; nonlinear
+  features (per-neuron sample variance, norms) might still carry signal —
+  but the fusion no-go suggests limited headroom.
+- **Deduction–projection / L² sketching for depth (ARC's May-2026 framework):**
+  the principled fix for the L^K depth blow-up — after each exact layer step,
+  project the activation-distribution representation onto the top
+  eigenfunctions of a kernel matched to the *remaining* computation, instead
+  of truncating at a fixed cumulant order. ARC has this working for 1 layer
+  only. The offline-learnable ingredient (the kernel/eigenfunctions per layer
+  index) fits this contest's ship-precomputation rule; the in-budget cost
+  would be projection matmuls (O(n²k) per layer). Highest-upside, highest-
+  effort direction on the board — the natural phase-2 project.
+
+### Point-set optimization verdict (round 4)
+
+SGD on the point matrix against the true ensemble (fresh MLP + fresh batch
+per step, unbiased loss, spherical re-projection): **init 3.751e-6, best
+3.644e-6 (+2.9%, within validation noise), then degrades** — gradient noise
+destroys the Sobol structure faster than the tiny signal improves it. A
+refinement run (12 MLPs/step, lr 3e-4) is the final attempt. Together with
+the weights result, the conclusion stands: **uniform-weighted Sobol+mm points
+at the floor are ≈ the optimum of the fixed-quadrature family.** Remaining
+levers are per-MLP information channels (dictionary selection, robust
+aggregation) or the depth-robust analytic frontier above.
