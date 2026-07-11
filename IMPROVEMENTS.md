@@ -122,4 +122,56 @@ per-MLP variance-reduction (suggestion 2) is the next lever.
 
 11. Stage 5 (`whest package`): tarball built (`submission-20260711-174747.tar.gz`).
 12. `whest submit --estimator estimator.py --watch`: first submission shipped to
-    AIcrowd (see conversation for the returned score).
+    AIcrowd.
+
+## First leaderboard result (public split, 50 MLPs)
+
+- **Adjusted score 6.526e-7** — 0/50 failures, 9.16% budget utilization.
+- **Exactly 1.0× the organizers' Monte Carlo reference (6.47e-7)** — as expected,
+  since this estimator *is* floor-budget MC. Antithetic pairing bought ~nothing:
+  after 32 ReLU layers the output has almost no odd (sign-linear) dependence on
+  the input, which also predicts the linearized `J·x` control variate won't help.
+- Spread: best MLP 9.75e-8, worst 2.58e-6, IQR 2.7e-7–7.4e-7 → the mean is
+  dominated by a few high-variance MLPs; adaptive per-MLP fusion helps most there.
+- Next levers, in order: (a) bump `_BUDGET_FRACTION` 0.09 → ~0.097 (~7% free);
+  (b) per-neuron fusion with a flopscope port of kprop K=2, weights leaning on
+  the analytic side for high-variance MLPs/neurons (oracle bound ~1.5×);
+  (c) variance reduction that survives depth: exact-radius sampling (ReLU nets
+  without bias are positively 1-homogeneous, so E[act] = E[r]·E[act(u)] with
+  E[r] = √2·Γ((n+1)/2)/Γ(n/2) known exactly), orthogonal/stratified directions;
+  (d) speculative: multilevel telescoping across depth with analytic tails.
+
+## Round 2 experiments (same day)
+
+**kprop K=2 fusion: tested and rejected** (`fusion_test.py`, 10 seeds).
+A self-contained flopscope-portable K=2 port (Wick-series covariance to k=4,
+exact diagonal) was verified against `mlp_kprop` (seed 0: 1.44e-5 vs 1.67e-5 —
+port slightly better). But fusion with MC lost to pure MC: mean final-layer MSE
+pure MC 6.49e-6 vs fuse-A 7.43e-6, fuse-B 7.05e-6; even oracle per-neuron
+weights only reach 4.74e-6 (1.37×). The per-neuron bias signal `(mc − analytic)`
+has detection noise equal to the MC noise itself, so realistic weighting is net
+negative. Conclusion: no analytic component; spend everything on sampling.
+
+**Quasi-Monte Carlo: tested and adopted** (`qmc_test.py`, 8 seeds, 6.3k points):
+
+| point set | final-layer MSE (mean) |
+|---|---|
+| iid N(0,1) (previous submission) | 8.41e-6 |
+| scrambled Sobol → Gaussian | 2.77e-6 |
+| **Sobol + exact moment matching** | **2.65e-6 (3.2× better)** |
+| iid + moment matching | 4.15e-6 |
+
+The point set is input-distribution-only, so it is computed **offline**
+(off-budget), moment-matched exactly (max |mean| 5e-17, max |cov−I| 1e-14),
+and shipped as `points.npz` (`flopscope.Module`, 0-FLOP load in `setup()`).
+This also eliminates the in-budget RNG cost. `estimator.py` v2: forward passes
+over the shipped 6272-point set sized to ~9.6% of budget, iid-RNG fallback for
+non-256-wide shapes. Antithetic dropped (measured ~no gain at depth 32).
+
+**Mini-split, estimator v2:** adjusted score **4.28e-07** (was 9.20e-07 —
+2.15× better), raw final-layer MSE 4.28e-06, all-layers 7.73e-06, utilization
+9.59%, 0/100 failed. Expected public-split score ~3e-7 ≈ 0.5× the MC reference.
+
+Packaging note: submissions must use **folder mode** (`whest package/submit
+--estimator . --yes`) so `points.npz` ships; the kit's `.gitignore` had a
+`*.npz` rule that silently excluded it (removed).

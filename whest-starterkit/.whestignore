@@ -29,3 +29,6 @@ Makefile
 README.md
 pyproject.toml
 uv.lock
+.git-upstream/
+*.tar.gz
+IMPROVEMENTS.md
