@@ -548,7 +548,33 @@ compounding. The stronger form — **end-to-end calibration**, 6 learned
 scalars per layer *inside* the closure update (192 universal parameters),
 trained by autograd through the full K=2 propagation on a fresh random MLP
 per step (unbiased loss, no overfitting channel) — corrects errors before
-they compound. Experiment `calibrated_k2.py`: *(results below)*
+they compound. Experiment `calibrated_k2.py`:
+
+**End-to-end calibration works: K=2 held-out MSE 7.18e-5 → 2.41e-5 (3×,
+66% of the closure error removed).** (First attempt diverged — multiplicative
+corrections compound as (1+p)³²; fixed with 0.05·tanh bounding, gradient
+clipping, 4 MLPs/step, lr 2e-4. Converges within ~450 steps, stable.)
+This is the largest analytic-side improvement measured all day and confirms
+the premise: a large share of the Gaussian-closure error is universal and
+shippable as 192 offline-learned scalars.
+
+**But the exchange rate nets it to small change:** K=2 costs ~4e9 FLOPs ≈
+950 samples ≈ 15% of the floor sample budget. Fusing calibrated-K2 (b² =
+2.4e-5) with QMC (v ≈ 4.1e-6) gives fused MSE b²v/(b²+v) ≈ 3.5e-6 (−12.5%),
+of which most is paid back either as fewer QMC points or as an over-floor
+multiplier. Honest projected net: **−2 to −6% score** — verified empirically
+in `fused_v4_check.py` (results below), including the error-independence
+assumption and a train/val split for the global fusion weight.
+
+### v3.1 post-mortem: the floor is not a cliff
+
+The "free fix" (trim to 9.95% utilization) was a sign error, and the public
+split confirmed it to four significant figures: 3.689e-7 × 1.011 (MSE of 70
+fewer points) × 0.994 (multiplier refund) = 3.708e-7 predicted, 3.709e-7
+measured. General lesson: above the floor the multiplier is linear in C and
+trimmed-set MSE is ~linear in 1/N (local β ≈ 1), so **the score surface is
+flat to first order around the floor** — only the 100%-budget line is a
+cliff. Reverted to the v3 configuration; v3 (3.689e-7) stands as best.
 
 ## v3 (shipped)
 
