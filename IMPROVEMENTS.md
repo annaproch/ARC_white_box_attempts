@@ -175,3 +175,99 @@ non-256-wide shapes. Antithetic dropped (measured ~no gain at depth 32).
 Packaging note: submissions must use **folder mode** (`whest package/submit
 --estimator . --yes`) so `points.npz` ships; the kit's `.gitignore` had a
 `*.npz` rule that silently excluded it (removed).
+
+---
+
+# Strategy: how to win (deep-dive, 2026-07-11 evening)
+
+## Sources reviewed in full
+
+- **arXiv:2605.05179 incl. appendices.** Decisive facts: (App. D) kprop MSE
+  scales as c_K·(L/n)^K — error *grows* with depth as L^K, and the authors
+  state the open problem: *"a sample-free algorithm whose error does not
+  increase with depth… we leave this to future work"*. (Table 1, App. J) exact
+  FLOP polynomials: K=2 basic 7n³L; K=2 augmented 11n³L (~5.9e9 — affordable,
+  tested below); factorized K=3 30n³L² (~5.2e11 — the L² term is fatal at
+  L=32). (App. E) power cumulants + odd-K trace are essential (ablation → O(1)
+  error). (App. I) even the authors' wall-clock is dominated by Python-side
+  elementwise work — mirrors the challenge's λ·R residual penalty.
+- **mlp_cumulant_propagation repo.** TODOs are engineering-level. One
+  strategic note (`symb/README.md`): whole-network tensor-network contraction
+  can beat layerwise propagation asymptotically, "but constants too large to
+  be practical".
+- **alignment.org**: Competing with sampling (Matching Sampling Principle:
+  beat O(1/ε²) sampling given structure), Estimating tail risk (layer-by-layer
+  modeling loses cross-layer info), AlgZoo.
+- **Dunbar & Aaronson (arXiv:2510.06527)**: deep random nets have nearly
+  independent outputs *iff the activation has zero Gaussian mean*. ReLU has
+  E[ReLU(Z)] > 0 ⇒ deep ReLU nets are the maximally-correlated case: final
+  activations for any two inputs are strongly correlated (correlation → 1
+  with depth). Deep-net fluctuations across inputs are low-effective-dimension.
+- **Wu & Hilton LPE (ICLR 2025)**: importance sampling > activation
+  extrapolation — tail-specific, not directly transferable to mean estimation.
+
+## The scoring math (what actually matters)
+
+Score = final-layer MSE × max(0.1, C/B), B = 2.72e11, C includes λ·wall-time.
+Three regimes:
+
+1. **Below 10% of B, compute is free** → the only question is: what is the
+   most accurate estimator costing ≤ 2.72e10 FLOPs?
+2. **Above the floor**, an estimator with MSE ∝ C^(−β) has score ∝ C^(1−β):
+   worth exceeding the floor iff β > 1. *Measured*: iid MC β = 1 by
+   definition (score flat); our moment-matched Sobol QMC has **β ≈ 0.83 < 1**
+   (its edge decays with N; at full budget QMC ≈ iid). **The floor is the
+   optimal operating point.** (Measured score curve: 2.69e-7 at 10%, 3.72e-7
+   at 20%, 4.68e-7 at 100%.)
+3. Ground truth is itself MC with N=1e9 ⇒ irreducible score floor ≈
+   Var/1e9/10 ≈ 1e-12. Irrelevant for now (we're at ~3e-7).
+
+## Why sampling wins here, mathematically
+
+At depth 32 the kprop error c_K(L/n)^K is ~(1/8)^K per unit variance, while
+final-layer activation variance has *decayed* to ~0.012 (mean |μ| ≈ 0.23) —
+so sampling error Var/N at the free floor (~6.5k samples) is ~2e-6·(per-MLP
+spread), an order of magnitude below any in-budget analytic method. Deep
+correlation collapse (Dunbar–Aaronson) hurts analytics but *helps* sampling:
+the integrand family is nearly constant + low-rank fluctuations.
+
+## The kernel-quadrature framing (the key idea)
+
+For a **fixed** point set P = {p_1..p_N} with weights w, the leaderboard
+averages over random W, so the expected squared error is exactly a
+**Bayesian-quadrature discrepancy** under the depth-32 NNGP kernel
+κ(p,q) = E_W[act_i(p)·act_i(q)] (computable in closed form by the arccos/ReLU
+kernel recursion — or empirically):
+
+    E_W[err²] = wᵀ K w − 2 wᵀ κ̄ + E_{x,x'}[κ],   κ̄(p) = E_x[κ(p,x)]
+
+Everything on the right is *independent of the test MLPs* — so both the
+**weights** (convex problem, w* = K⁻¹κ̄) and the **points** (gradient descent)
+can be optimized **offline and hardcoded**, at zero extra predict cost
+(a weighted mean costs the same FLOPs as a plain mean). This directly answers
+"find patterns empirically through sampling and hardcode them": the pattern
+IS the kernel, and the offline-optimal quadrature rule is its exploitation.
+
+Practical version (subsumes BQ, captures finite-width effects): generate
+hundreds of MLPs offline with high-precision ground truth, and **ridge-regress
+fixed weights w** (plus a global coefficient on cheap analytic features like
+the mean-prop estimate) minimizing average ||Σ_j w_j·act(p_j) − truth||² —
+validated on held-out MLPs and the public split. Overfitting is controlled by
+ridge toward uniform 1/N and by the huge effective sample count
+(MLPs × 256 neurons per MLP).
+
+## Ranked plan
+
+1. **Learned quadrature weights** (offline ridge on ~300 MLPs) — in progress.
+2. **Learned/optimized point set** (SGD through the same objective, init at
+   Sobol-mm) — second-order refinement once weights plateau.
+3. **Global-coefficient analytic fusion** inside the same regression (mean-prop
+   / K=2 features with *offline-learned* fixed coefficients — per-MLP adaptive
+   weighting already failed; global learned coefficients are the sound form).
+4. **K=2-augmented** check (5.9e9 FLOPs): the only affordable untested kprop
+   variant. *Result: rejected* — final MSE 6.3e-4 / 2.4e-3 / 7e+3 over 3 seeds
+   (numerically unstable at depth 32; its own variance clamp fires). Every
+   kprop variant is now measured at the challenge shape and out.
+5. Out-of-scope after measurement: K≥3 (budget), antithetic & linearized
+   control variates (no odd/linear signal at depth 32), per-MLP adaptive
+   fusion (bias detection noise = MC noise), running above the floor (β<1).
