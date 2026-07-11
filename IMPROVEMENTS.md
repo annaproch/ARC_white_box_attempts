@@ -433,14 +433,40 @@ ridge toward uniform 1/N and by the huge effective sample count
   would be projection matmuls (O(n²k) per layer). Highest-upside, highest-
   effort direction on the board — the natural phase-2 project.
 
+### The organizers' "Open directions" list, addressed
+
+The starterkit's algorithm-ideas.md flags five untried directions. Status
+against our measurements (key context: the ceiling of the analytic family —
+full K=2 covariance, 1.4% of budget — loses to floor-sampling ~10×, so
+refinements *within* that family are dominated):
+
+| Direction | Verdict | Reason |
+|---|---|---|
+| Low-rank covariance (UUᵀ, rank k) | dominated | cheaper approximation of full cov; compute isn't binding, accuracy is; frees FLOPs we don't need (~900 MC samples' worth) |
+| Layer-adaptive routing (full early → diagonal late) | dominated | full-cov-everywhere bounds this family's accuracy; the bias is joint-cumulant truncation over 32 layers, not budget placement |
+| Spectral / SVD in `setup()` | premise wrong + dominated | `setup(ctx)` never sees the MLP — per-MLP SVD can't be off-budget; affordable in `predict` but lands in the mean-prop accuracy class; learned coefficient on analytic features regressed to 0 |
+| Importance sampling | parked (untested, no identified edge) | no odd/linear input signal at depth 32, radial part exact, fluctuation spread (not rare-region-dominated — IS's win condition); right tool for tails, not means |
+| Higher-order moments (skew/kurtosis) | measured & rejected | = cumulant prop K≥3: over budget at L=32, no final-layer gain; marginal-skew variants can't capture the joint off-diagonal cumulants where K=2's bias lives |
+
 ### Point-set optimization verdict (round 4)
 
 SGD on the point matrix against the true ensemble (fresh MLP + fresh batch
 per step, unbiased loss, spherical re-projection): **init 3.751e-6, best
 3.644e-6 (+2.9%, within validation noise), then degrades** — gradient noise
-destroys the Sobol structure faster than the tiny signal improves it. A
-refinement run (12 MLPs/step, lr 3e-4) is the final attempt. Together with
-the weights result, the conclusion stands: **uniform-weighted Sobol+mm points
-at the floor are ≈ the optimum of the fixed-quadrature family.** Remaining
-levers are per-MLP information channels (dictionary selection, robust
-aggregation) or the depth-robust analytic frontier above.
+destroys the Sobol structure faster than the tiny signal improves it. The
+refinement run (12 MLPs/step, lr 3e-4) confirmed: best 3.681e-6 vs init
+3.754e-6 (+1.9%, noise). Together with the weights result, the conclusion
+stands: **uniform-weighted Sobol+mm points at the floor are ≈ the optimum of
+the fixed-quadrature family.** Remaining levers are per-MLP information
+channels (dictionary selection, robust aggregation) or the depth-robust
+analytic frontier above.
+
+## v3 (shipped)
+
+6,400 spherical points (Sobol → Gauss → whiten → project to radius
+E‖x‖ = √2·Γ(128.5)/Γ(128); exact radial integration by 1-homogeneity),
+`_BUDGET_FRACTION = 0.0991` to fill the floor (~9.95% grader utilization —
+the floor is soft, no cliff until 100%, so ~0.6% multiplier jitter is a good
+trade for 2% more points). **Mini split: 3.99e-07** (v2: 4.28e-07, −6.8%),
+0/100 failed. Expected public ≈ 3.4–3.6e-7 ≈ 1.8× better than the MC
+reference.
