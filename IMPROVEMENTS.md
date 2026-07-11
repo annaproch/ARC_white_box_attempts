@@ -566,6 +566,48 @@ multiplier. Honest projected net: **−2 to −6% score** — verified empirical
 in `fused_v4_check.py` (results below), including the error-independence
 assumption and a train/val split for the global fusion weight.
 
+## v4 (shipped): cumulants return via offline calibration
+
+`fused_v4_check.py` verified the fusion honestly: calibrated-K2 and QMC
+errors are independent (corr −0.04 held-out); global weight w = 0.137 fit on
+24 offline MLPs; cutting QMC points to stay under the floor is a losing
+trade (trimming the fixed set has local β ≈ 1.7), so v4 runs over the floor
+instead. Estimator: 6400-point QMC + flopscope port of the calibrated K=2
+(192 constants inlined; symmetric einsum ⇒ only ~0.6% of budget), fused at
+the final layer only, with a finiteness guard falling back to pure QMC.
+
+**Mini split (subprocess runner): 3.66e-07 vs v3 3.99e-07 (−8.3%);** raw MSE
+3.45e-6 (−13.5%), utilization 10.59%, 0/100 failed. Projected public
+≈ 3.4e-7 ≈ 1.9× the MC reference.
+
+## Incorporating K=3/K=4 information (round 6, in progress)
+
+K≥3 cannot *run* in-budget (L²-rank arithmetic), but its information enters
+three ways, in increasing order of fidelity:
+
+1. **Absorbed into the learned closure** (v4 does this implicitly): the
+   ensemble-systematic component of (K=3 − K=2) that is a function of the
+   K=2 state gets baked into the 192 calibration constants.
+2. **"K=2.5" — Edgeworth-corrected propagation** (training now): track the
+   *diagonal* third cumulant exactly through linear layers (κ₃ → (W∘³)ᵀκ₃,
+   multilinearity, ~n² per layer — free, no rank explosion), and add the
+   analytic Edgeworth correction terms to the mean/variance updates
+   (Δμ = −κ₃·α·φ(α)/(6σ²) from E[∂³ReLU], ΔE[z²] = κ₃·φ(α)/(3σ)), each with
+   an offline-learned scale, plus α-dependent basis corrections to the Wick
+   coefficients (12 params/layer). This is a hand-built instance of ARC's
+   deduction–projection idea: a bounded sketch of third-order structure with
+   a learned projection.
+3. **Rank-r factored third cumulant with learned ReLU gains** (future): the
+   linear step is exact and cheap for a factor U ∈ R^{n×r} (U ← WᵀU, n²r);
+   the expensive exact nonlinear update is replaced by a learned gain — the
+   full L²-sketching program. Only worth it if (2) plateaus well above the
+   K=3-augmented ceiling (1.8e-6).
+
+Fusion economics (why this matters): with QMC v ≈ 4.2e-6 fixed, driving the
+analytic bias² from 2.4e-5 → 1e-5 → 5e-6 moves the fused score −13% → −35%
+relative to v3. The K=3-augmented ceiling (1.8e-6) is the theoretical limit
+of what third-order information can contribute.
+
 ### v3.1 post-mortem: the floor is not a cliff
 
 The "free fix" (trim to 9.95% utilization) was a sign error, and the public
