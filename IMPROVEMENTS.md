@@ -461,6 +461,95 @@ the fixed-quadrature family.** Remaining levers are per-MLP information
 channels (dictionary selection, robust aggregation) or the depth-robust
 analytic frontier above.
 
+---
+
+# Cumulants revisited (round 5): the mathematics of a comeback
+
+Prompted by the (fair) challenge: did we give up on cumulants too fast?
+Re-derivation from first principles, all numbers at the 256×32 shape.
+
+## The score exchange rate (the master inequality)
+
+An estimator with per-MLP cost C and MSE m scores m·max(0.1, C/B).
+Floor-QMC sits at m_q ≈ 4.0e-6, C = 0.1B → score 4.0e-7. Therefore **any
+challenger must satisfy m ≤ 4.0e-6 · (0.1B / C)** — i.e. a method costing
+20% of budget must *halve* the MSE just to tie. This inequality kills every
+"where do we spend the K=3 budget" scheme before implementation:
+
+- **Full factorized-augmented K=3** (the family's accuracy ceiling): measured
+  1.8e-6 at seed 0 — genuinely better than sampling per FLOP-unconstrained
+  accuracy! — but costs 4.2×B. It *cannot be submitted* (hard zero), and even
+  rank-compressed to 50% of B it would need MSE ≤ 8e-7, a 2.3× improvement
+  over its own uncompressed accuracy. Rank compression degrades, not
+  improves. Dead by arithmetic.
+- **Early-layer K=3-augment (layers 0..j) then K=2:** cost ≈ 72n³j²/2. At
+  j=8: 3.9e10 (14% of B) and it corrects at most the first 8 layers' cumulant
+  injection — bounded by ~(1−j/L)-type reduction of K=2's 4.7e-5, i.e.
+  ~2-3e-5, needing ≤ 2.9e-6. Off by 10×. At j=4 it fits the floor but
+  corrects ~1/8 of the injection: ~3.6e-5 vs needed 4e-6. Off by 9×.
+- **Late-layer K=3:** the incoming third cumulants were already discarded by
+  the K=2 prefix — the information the upgrade needs is gone. Strictly worse
+  than the early variant per FLOP.
+- General form: partial-K schemes buy a *linear* fraction of the correction
+  at *quadratic* (rank-accumulation) cost, and the baseline gap is 10×.
+  There is no allocation of K=3 FLOPs across layers that passes the exchange
+  rate. This is why "be smart about where to use higher orders" fails *for
+  in-budget propagation* — not because the idea is bad, but because the whole
+  K=3 correction, even applied everywhere, is worth only ~parity with QMC
+  while costing 42× the floor.
+
+## Depth-telescoping: a clean negative theorem
+
+Multilevel MC across depth (cheap surrogate g from layer-j state, many
+samples of g + few of f−g) is *exactly break-even-or-worse* here: final
+log-amplitude accumulates as a near-Brownian walk over layers, so the
+correlation of any layer-j surrogate with the final output satisfies
+Corr² ≈ j/L — proportional to its cost j/L. MLMC's gain condition
+(√(V_diff·c_f) + √(V_g·c_g))² < V then evaluates to (√(1−ρ²) + ρ·√(c_g))²·V
+with ρ² = c_g, which is ≥ V for all j (minimum at the endpoints). The
+Brownian structure of deep ReLU amplitude makes depth-telescoping
+information-flat. (Same structure explains QMC's β < 1.)
+
+## The one live path: offline-calibrated closures + global fusion
+
+The Gaussian closure is *systematically* wrong in a way that is **universal
+across the MLP ensemble** (weights are exchangeable) — and universal errors
+can be measured offline to arbitrary precision and shipped as calibration
+tables at zero in-budget cost. This is the "learned closure" pattern from
+turbulence modeling: keep the white-box propagation (μ, Σ, and cheap
+diagonal-κ₃ at n² per layer), but correct each update — or regress the final
+error on the closure state — using coefficients fitted on offline MLPs.
+
+Why this reopens fusion: per-neuron fusion failed because K=2's bias
+(4.7e-5) ≫ MC noise (4e-6), making the optimal analytic weight ~0.08 and the
+weight estimate noise-dominated. But fusion weights can be **global,
+learned offline** (no per-MLP noise), and if calibration pushes the residual
+bias² b² down toward the QMC variance v, the fused MSE b²v/(b²+v) gives:
+b² = 8e-6 → 2.8e-6 (score 2.8e-7, −30%); b² = 4e-6 → 2.1e-6 (score 2.1e-7,
+−48%). **Win condition: calibrated K=2 residual bias² ≤ ~1e-5** (a 5×
+calibration of the raw 4.7e-5), with K=2's 3.8e9 FLOPs costing only ~2% of
+the sample budget.
+
+The ceiling is measurable: decompose K=2's error on offline MLPs into the
+part predictable from the K=2 internal state (ensemble-systematic ⇒
+calibratable) vs the remainder (idiosyncratic ⇒ irreducible given that
+state). Experiment `calibration_ceiling.py` (64 train + 24 held-out MLPs,
+ridge on final-layer closure state incl. a propagated diagonal-κ₃ feature):
+
+**Measured (held-out): 44% of K=2's error is ensemble-systematic.**
+Raw 7.03e-5 → 5.59e-5 removing a *global scalar offset alone* (20.5% — the
+Gaussian closure has a universal bias, confirming the premise) → 3.93e-5
+with state-feature ridge. Fusion projection at that residual: 3.70e-6 →
+score ~3.70e-7 vs v3's 3.99e-7 — only ~7%, because the residual is still
+~10× QMC noise.
+
+But post-hoc regression on the *final* state cannot undo 32 layers of error
+compounding. The stronger form — **end-to-end calibration**, 6 learned
+scalars per layer *inside* the closure update (192 universal parameters),
+trained by autograd through the full K=2 propagation on a fresh random MLP
+per step (unbiased loss, no overfitting channel) — corrects errors before
+they compound. Experiment `calibrated_k2.py`: *(results below)*
+
 ## v3 (shipped)
 
 6,400 spherical points (Sobol → Gauss → whiten → project to radius
@@ -470,3 +559,13 @@ the floor is soft, no cliff until 100%, so ~0.6% multiplier jitter is a good
 trade for 2% more points). **Mini split: 3.99e-07** (v2: 4.28e-07, −6.8%),
 0/100 failed. Expected public ≈ 3.4–3.6e-7 ≈ 1.8× better than the MC
 reference.
+
+**v3 public result: 3.689e-7** (v2: 3.783e-7 — only −2.5% vs −6.8% on mini).
+Decomposition: grader utilization came in at **10.06%** (the predicted
+over-floor: grader residual wall-time is ~4ms/MLP heavier than local), so the
+mean multiplier was ~0.1006 → ~0.6% given back; the rest is public-set
+variation (raw MSE −2.9% there vs −6.8% on mini). Not a failure — the
+over-floor risk priced in advance materialized exactly. **Lesson for v4:
+fraction ≈ 0.098 → multiplier pinned at 0.1000, reclaiming the 0.6% for
+free.** Now 1.8× ahead of the MC reference; worst-MLP 1.18e-6 and best
+5.17e-8 essentially unchanged from v2.
