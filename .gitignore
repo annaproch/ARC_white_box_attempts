@@ -1,0 +1,19 @@
+# separate git clone (ARC's reference repo) — not ours to track
+mlp_cumulant_propagation/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.egg-info/
+
+# build artifacts / submissions
+*.tar.gz
+
+# local tooling
+.claude/
+.DS_Store
+whest-starterkit/.git-upstream/

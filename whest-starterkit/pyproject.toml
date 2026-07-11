@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whest-starterkit"
+version = "0.1.0"
+description = "Starter kit for the ARC Whitebox Estimation Challenge"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "flopscope>=0.8.0rc5,<0.9.0",
+    "whestbench>=0.12.0rc3,<0.13.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+    "ruff>=0.6.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
