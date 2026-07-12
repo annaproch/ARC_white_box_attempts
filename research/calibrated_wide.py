@@ -1,92 +1,104 @@
-"""Wide-bound calibrated K=2: let the closure apply the correction the data demands.
+"""Wide-bound calibrated K=2 — BATCHED on the GPU.
 
-Diagnosis chain:
-  * 98% of K=2's final-layer error is propagated-moment error (error_attribution.py)
-  * the moment error is a ~30% underestimate of sigma_z, caused by a 27-43%
-    underestimate of Sigma's top eigenvalue / mean off-diagonal (layerwise_cov_drift.py)
-  * our previous calibration bounded every correction to 0.05*tanh(theta) = +-5%,
-    so it COULD NOT express a 30-40% covariance correction. It still bought 3x.
-  * the rank-1 non-Gaussian core (core_closure.py) does not fix it: the drift
-    accumulates over layers 2-11, where eig1frac is only 0.03-0.27 (not rank-1).
+Why wide bounds: 98% of K=2's final-layer error is propagated-moment error
+(error_attribution.py), driven by a 27-43% UNDERESTIMATE of Sigma's top
+eigenvalue / mean off-diagonal (layerwise_cov_drift.py). Our previous
+calibration clamped every correction to 0.05*tanh = +-5% -- it could not
+express a 30-40% covariance correction, yet still bought 3x. Here the closure
+gets per-layer off-diagonal / diagonal scalings with +-60% bounds.
 
-So: keep the K=2 closure, but give it per-layer WIDE-bound scalings aimed
-exactly at the measured bias:
-    off-diagonal covariance  *= (1 + s_off_l)     |s_off| <= 0.6
-    diagonal variance        *= (1 + s_dia_l)     |s_dia| <= 0.6
-plus small corrections to the ReLU mean formula (p, q, m; +-10%).
-
-Trained end-to-end through all 32 layers by autograd, with a FRESH random MLP
-every step (unbiased loss -> no overfitting channel), validated on 24 fixed
-held-out MLPs. Also reports the resulting lambda1 error vs sampled truth, to
-confirm the mechanism is actually fixed rather than merely fitted.
+Why batched: every op is a 256x256 matmul -- tiny for this GPU. Propagating one
+MLP at a time in float64 on the CPU was latency-bound. This version keeps ALL
+MLPs in one (B, n, n) bmm on MPS in float32 (which is what the shipped
+flopscope estimator uses anyway), and caches validation ground truth to disk.
+~10-30x faster => more steps, more MLPs/step, richer closures.
 
 Run:  cd ../mlp_cumulant_propagation && uv run python ../research/calibrated_wide.py
+      flags: --steps 3000 --batch-mlps 16 --refresh-val
 """
 
+import argparse
 import math
 import time
+from pathlib import Path
 
-import numpy as np
 import torch
 
-torch.set_grad_enabled(False)
 DEV = "mps" if torch.backends.mps.is_available() else "cpu"
 N_W, DEPTH = 256, 32
 SQ2PI = math.sqrt(2 * math.pi)
-GT_N, BATCH = 2_000_000, 131_072
-M_VAL = 24
-STEPS, MLPS_STEP, X_BATCH = 2000, 4, 8192
-EVAL_EVERY = 100
 N_TERMS = 4
-SCRATCH = "/private/tmp/claude-501/-Users-lisek-Projects-ARC-white-box/fffd79fe-57cb-423a-9b9c-e89e35bd048e/scratchpad"
+DATA = Path(__file__).resolve().parent.parent / "data"
+DATA.mkdir(exist_ok=True)
+VAL_CACHE = DATA / "val_gt_24.pt"
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--steps", type=int, default=3000)
+ap.add_argument("--batch-mlps", type=int, default=16)   # MLPs propagated per step
+ap.add_argument("--x-batch", type=int, default=8192)    # MC samples for the target
+ap.add_argument("--val-mlps", type=int, default=24)
+ap.add_argument("--val-samples", type=int, default=2_000_000)
+ap.add_argument("--eval-every", type=int, default=100)
+ap.add_argument("--lr", type=float, default=5e-3)
+ap.add_argument("--refresh-val", action="store_true")
+args = ap.parse_args()
 
 
-def build_ws(seed):
-    g = torch.Generator().manual_seed(seed)
-    return [(torch.randn(N_W, N_W, generator=g) * math.sqrt(2.0 / N_W)).to(DEV)
-            for _ in range(DEPTH)]
+def make_ws(seeds):
+    """(B, L, n, n) He-init weights on DEV, float32."""
+    out = []
+    for s in seeds:
+        g = torch.Generator().manual_seed(int(s))
+        out.append(torch.randn(DEPTH, N_W, N_W, generator=g) * math.sqrt(2.0 / N_W))
+    return torch.stack(out).to(DEV)
 
 
-def gt_mean(ws, n):
-    s = torch.zeros(N_W, dtype=torch.float64)
-    d = 0
-    while d < n:
-        b = min(BATCH, n - d)
-        x = torch.randn(b, N_W, device=DEV)
-        for w in ws:
-            x = torch.relu(x @ w)
-        s += x.sum(0).cpu().double()
-        d += b
-    return s / n
+def mc_final(Ws, n_samples, chunk=16384):
+    """Batched sampled final-layer mean: Ws (B,L,n,n) -> (B,n) float32 on DEV."""
+    B = Ws.shape[0]
+    acc = torch.zeros(B, N_W, device=DEV, dtype=torch.float32)
+    done = 0
+    while done < n_samples:
+        c = min(chunk, n_samples - done)
+        x = torch.randn(B, c, N_W, device=DEV)
+        for li in range(DEPTH):
+            x = torch.relu(torch.bmm(x, Ws[:, li]))
+        acc += x.sum(1)
+        done += c
+    return acc / n_samples
 
 
-def k2_forward(ws, theta, want_lam=False):
-    """theta[l] = (p, q, m, s_off, s_dia, g2s). theta=0 -> plain K=2."""
-    mu = torch.zeros(N_W, device=DEV)
-    cov = torch.eye(N_W, device=DEV)
+def k2_batched(Ws, theta):
+    """Batched K=2 covariance propagation with per-layer wide-bound corrections.
+    Ws (B,L,n,n); theta (L,6). Returns final-layer mean (B,n)."""
+    B = Ws.shape[0]
+    mu = torch.zeros(B, N_W, device=DEV)
+    cov = torch.eye(N_W, device=DEV).expand(B, N_W, N_W).contiguous()
     eye = torch.eye(N_W, device=DEV)
-    lam_out = []
-    for l, W in enumerate(ws):
-        t = theta[l]
-        p, q, m = 0.10 * torch.tanh(t[0]), 0.10 * torch.tanh(t[1]), 0.10 * torch.tanh(t[2])
-        s_off = 0.60 * torch.tanh(t[3])     # <-- the correction the data demands
+    for li in range(DEPTH):
+        W = Ws[:, li]                                    # (B,n,n)
+        t = theta[li]
+        p = 0.10 * torch.tanh(t[0])
+        q = 0.10 * torch.tanh(t[1])
+        m = 0.10 * torch.tanh(t[2])
+        s_off = 0.60 * torch.tanh(t[3])                  # the correction the data demands
         s_dia = 0.60 * torch.tanh(t[4])
         g2s = 0.30 * torch.tanh(t[5])
 
-        mu_pre = mu @ W
-        cov_pre = W.T @ (cov @ W)
-        var = torch.clamp(torch.diagonal(cov_pre), min=1e-10)
+        mu_pre = torch.bmm(mu.unsqueeze(1), W).squeeze(1)             # (B,n)
+        cov_pre = torch.bmm(W.transpose(1, 2), torch.bmm(cov, W))     # (B,n,n)
+        var = torch.clamp(torch.diagonal(cov_pre, dim1=1, dim2=2), min=1e-10)
         s = var.sqrt()
         a = mu_pre / s
         pdf = torch.exp(-0.5 * a * a) / SQ2PI
         cdf = 0.5 * (1 + torch.erf(a / math.sqrt(2)))
-        rho = torch.clamp(cov_pre / torch.outer(s, s), -1.0, 1.0)
+        ss = s.unsqueeze(2) * s.unsqueeze(1)                          # (B,n,n)
+        rho = torch.clamp(cov_pre / ss, -1.0, 1.0)
 
         mu_new = s * pdf * (1 + p) + mu_pre * cdf * (1 + q) + m * s
         ez2 = (mu_pre**2 + var) * cdf + mu_pre * s * pdf
         var_post = torch.clamp(ez2 - mu_new**2, min=1e-12) * (1 + s_dia)
 
-        # converged Wick series (k<=4) in the stable dimensionless form
         g = [cdf, pdf * (1 + g2s)]
         he_prev, he_cur = torch.ones_like(a), a
         for k in range(3, N_TERMS + 1):
@@ -94,80 +106,82 @@ def k2_forward(ws, theta, want_lam=False):
             g.append(((-1) ** mm) * he_cur * pdf)
             he_prev, he_cur = he_cur, a * he_cur - mm * he_prev
         acc = torch.zeros_like(cov_pre)
-        rho_k, sf = rho.clone(), 1.0
+        rho_k, sf = rho, 1.0
         for k in range(1, N_TERMS + 1):
             sf *= math.sqrt(k)
             gh = g[k - 1] / sf
-            acc = acc + torch.outer(gh, gh) * rho_k
+            acc = acc + gh.unsqueeze(2) * gh.unsqueeze(1) * rho_k
             if k < N_TERMS:
                 rho_k = rho_k * rho
-        cov_new = torch.outer(s, s) * acc * (1 + s_off)      # boost off-diagonals
-        cov_new = cov_new * (1 - eye) + torch.diag(var_post)  # exact diagonal (scaled)
-        if want_lam:
-            lam_out.append(float(torch.linalg.eigvalsh(cov_new.double())[-1]))
+        cov_new = ss * acc * (1 + s_off)
+        cov_new = cov_new * (1 - eye) + torch.diag_embed(var_post)
         mu, cov = mu_new, cov_new
-    return (mu, lam_out) if want_lam else mu
+    return mu
 
 
-print("building validation set (24 MLPs, 2e6-sample ground truth)...")
-val = []
-t0 = time.time()
-for i in range(M_VAL):
-    ws = build_ws(80_000 + i)
-    val.append((ws, gt_mean(ws, GT_N)))
-print(f"  done ({time.time()-t0:.0f}s)")
+# ---- validation set (cached) ----------------------------------------------
+if VAL_CACHE.exists() and not args.refresh_val:
+    blob = torch.load(VAL_CACHE)
+    val_seeds, val_gt = blob["seeds"], blob["gt"].to(DEV)
+    print(f"loaded cached validation GT ({len(val_seeds)} MLPs, "
+          f"{blob['n_samples']:.0e} samples each)")
+else:
+    val_seeds = list(range(80_000, 80_000 + args.val_mlps))
+    t0 = time.time()
+    Wv = make_ws(val_seeds)
+    val_gt = mc_final(Wv, args.val_samples)
+    torch.save({"seeds": val_seeds, "gt": val_gt.cpu(), "n_samples": args.val_samples},
+               VAL_CACHE)
+    del Wv
+    print(f"built validation GT: {len(val_seeds)} MLPs x {args.val_samples:.0e} "
+          f"samples in {time.time()-t0:.0f}s (cached to {VAL_CACHE.name})")
+
+WV = make_ws(val_seeds)
 
 
+@torch.no_grad()
 def val_mse(theta):
-    tot = 0.0
-    for ws, gt in val:
-        tot += float(((k2_forward(ws, theta).cpu().double() - gt) ** 2).mean()) / M_VAL
-    return tot
+    est = k2_batched(WV, theta)
+    return float(((est - val_gt) ** 2).mean())
 
 
 theta0 = torch.zeros(DEPTH, 6, device=DEV)
 base = val_mse(theta0)
 print(f"plain K=2 (theta=0): {base:.3e}")
 
-torch.set_grad_enabled(True)
 theta = torch.zeros(DEPTH, 6, device=DEV, requires_grad=True)
-opt = torch.optim.Adam([theta], lr=3e-3)
+opt = torch.optim.Adam([theta], lr=args.lr)
 best = (base, theta0.clone())
 t0 = time.time()
-for step in range(1, STEPS + 1):
+for step in range(1, args.steps + 1):
+    seeds = torch.randint(3_000_000, 9_000_000, (args.batch_mlps,)).tolist()
+    Ws = make_ws(seeds)
+    with torch.no_grad():
+        target = mc_final(Ws, args.x_batch)          # unbiased MC target (B,n)
+    est = k2_batched(Ws, theta)
+    loss = ((est * est).sum(1) - 2 * (est * target).sum(1)).mean()
     opt.zero_grad()
-    loss = torch.zeros((), device=DEV)
-    for k in range(MLPS_STEP):
-        ws = build_ws(3_000_000 + step * MLPS_STEP + k)
-        est = k2_forward(ws, theta)
-        with torch.no_grad():
-            x = torch.randn(X_BATCH, N_W, device=DEV)
-            for w in ws:
-                x = torch.relu(x @ w)
-            m_x = x.mean(0)
-        loss = loss + ((est * est).sum() - 2 * (est * m_x).sum()) / MLPS_STEP
     loss.backward()
     torch.nn.utils.clip_grad_norm_([theta], 1.0)
     opt.step()
-    if step % EVAL_EVERY == 0:
-        with torch.no_grad():
-            v = val_mse(theta.detach())
+    if step % args.eval_every == 0:
+        v = val_mse(theta.detach())
         if v < best[0]:
             best = (v, theta.detach().clone())
-        print(f"step {step:5d}  val {v:.3e}  best {best[0]:.3e}  ({time.time()-t0:.0f}s)")
+        print(f"step {step:5d}  val {v:.3e}  best {best[0]:.3e}  "
+              f"({time.time()-t0:.0f}s, {step/(time.time()-t0):.1f} steps/s)")
 
-torch.set_grad_enabled(False)
 th = best[1]
 print(f"\nplain K=2      : {base:.3e}")
 print(f"wide-calibrated: {best[0]:.3e}   ({base/best[0]:.2f}x)")
-print(f"(previous +-5% calibration reached ~2.4e-5, i.e. ~3x)")
+print("(previous +-5%-clamped calibration reached ~2.4e-5, i.e. ~3x)")
 
-s_off = (0.60 * torch.tanh(th[:, 3])).cpu().numpy()
-s_dia = (0.60 * torch.tanh(th[:, 4])).cpu().numpy()
-print("\nlearned per-layer covariance corrections (the measured bias was -27..-43% on lam1):")
+s_off = (0.60 * torch.tanh(th[:, 3])).cpu()
+s_dia = (0.60 * torch.tanh(th[:, 4])).cpu()
+print("\nlearned covariance corrections (measured bias: -27..-43% on lambda1):")
 for l in (0, 1, 2, 3, 7, 15, 23, 31):
     print(f"  L{l:2d}: off-diag {s_off[l]:+.3f}   diag {s_dia[l]:+.3f}")
 
-np.save(f"{SCRATCH}/theta_wide.npy", th.cpu().numpy())
-print(f"\nsaved theta_wide.npy")
-print("If this lands near ~5e-6 or below, go pure-analytic at the floor (drop QMC).")
+torch.save(th.cpu(), DATA / "theta_wide.pt")
+print(f"\nsaved {DATA / 'theta_wide.pt'}")
+print("<=5e-6 => go pure-analytic at the floor (drop QMC).")
