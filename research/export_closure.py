@@ -39,8 +39,10 @@ import calibrate_k3k4 as K   # import is side-effect free (training lives in mai
 ck = torch.load(DATA / "calib_k3k4.pt", map_location=DEV)
 theta = ck["best_theta"].to(DEV)
 rank = int(ck.get("rank", 16))
-K.set_rank(rank)
-print(f"checkpoint: step {ck['step']}, best val {ck['best_val']:.3e}, rank {rank}")
+rank4 = int(ck.get("rank4", min(8, rank)))
+K.set_rank(rank, rank4)
+print(f"checkpoint: step {ck['step']}, best val {ck['best_val']:.3e}, "
+      f"rank3 {rank} / rank4 {rank4}")
 
 # ---- held-out MLPs (disjoint from training and from the val set that picked theta)
 seeds = list(range(950_000, 950_000 + 16))
@@ -89,7 +91,8 @@ B_FLOP = 2.72e11
 PT_FLOP = DEPTH * (2 * N_W * N_W + 2 * N_W)          # per QMC point
 K2_FLOP = 2.2e9                                      # v4's calibrated-K2 closure
 CL_FLOP = DEPTH * (6.0 * N_W ** 3 + 4.0 * N_W ** 2 * rank
-                   + 2.0 * N_W * rank ** 4 + 2.0 * rank ** 5)
+                   + 2.0 * N_W * rank ** 3 + 2.0 * rank ** 4        # kappa3 core
+                   + 2.0 * N_W * rank4 ** 4 + 2.0 * rank4 ** 5)     # kappa4 core
 V4_PTS = 6400
 V4_C = V4_PTS * PT_FLOP + K2_FLOP                    # ~2.9e10 = 10.9% (matches grader)
 
@@ -113,7 +116,7 @@ est_k2 = k2_v4(Ws)
 mse = lambda e: float((e ** 2).mean())
 
 print(f"\nFLOP model: QMC pt {PT_FLOP:.2e} | K2 {K2_FLOP:.1e} | "
-      f"closure(r={rank}) {CL_FLOP:.2e} ({CL_FLOP/B_FLOP:.1%} of budget)")
+      f"closure(r3={rank},r4={rank4}) {CL_FLOP:.2e} ({CL_FLOP/B_FLOP:.1%} of budget)")
 
 # v4 baseline on THESE MLPs
 e_q, e_k2, e_c = est_q_full - gt, est_k2 - gt, est_c - gt
@@ -150,8 +153,8 @@ if s_best < s_v4 * 0.995:
     np.savez(KIT / "closure.npz",
              theta=theta.cpu().numpy().astype(np.float32),
              meta=np.array([float(rank), float(n_best),
-                            float(w_best[0]), float(w_best[1]), float(w_best[2])],
-                           dtype=np.float32),
+                            float(w_best[0]), float(w_best[1]), float(w_best[2]),
+                            float(rank4)], dtype=np.float32),
              **{"__meta__": np.frombuffer(b"{}", dtype=np.uint8)})
     print(f"wrote {KIT/'closure.npz'} (rank {rank}, pts {n_best}, "
           f"w {w_best.round(3).tolist()})")

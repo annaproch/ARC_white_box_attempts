@@ -51,7 +51,8 @@ VAL_CACHE = DATA / "val_gt_24.pt"
 
 def _parse():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument("--rank", type=int, default=32)      # kappa3 rank
+    ap.add_argument("--rank4", type=int, default=8)      # kappa4 rank (cost ~ n r^4)
     ap.add_argument("--batch-mlps", type=int, default=8)
     # the MC target is an UNBIASED gradient signal at any batch size, so a small
     # x-batch just adds gradient noise -- and it dominates step cost. 2048 is ~4x
@@ -71,9 +72,16 @@ def _parse():
     return ap.parse_args()
 
 
-# Module-level rank so the closure can be imported and reused (export_closure.py).
+# Module-level ranks so the closure can be imported and reused (export_closure.py).
 # Call set_rank() to match a checkpoint before calling closure().
-R = 16
+#
+# kappa3's core costs O(n r^3), kappa4's costs O(n r^4) -- at r=32 the kappa4 core
+# alone was 1.7e10 FLOPs (8.4% of budget), which doubled the score multiplier and
+# ate a real 9% accuracy gain. kappa4 is nearly rank-1 at depth (measured), so it
+# needs far less rank than kappa3. R4 indexes the LEADING columns of the (sorted)
+# basis, i.e. kappa4 lives in kappa3's dominant sub-subspace.
+R = 16      # kappa3 rank
+R4 = 8      # kappa4 rank (<= R)
 
 # 13 params/layer: [p, q, moff, s_dia, s_off, c3m, c3c, c3g, c3p, c4m, c4c, c4g, c4p]
 NP = 13
@@ -125,10 +133,11 @@ def mc_final(Ws, n_samples, chunk=16384):
 _Q0 = torch.randn(N_W, R, generator=torch.Generator().manual_seed(7)).to(DEV)
 
 
-def set_rank(r):
-    """Set the Tucker rank (and reseed the subspace-iteration start block)."""
-    global R, _Q0
+def set_rank(r, r4=None):
+    """Set the kappa3 rank (and kappa4's, defaulting to min(8, r))."""
+    global R, R4, _Q0
     R = int(r)
+    R4 = int(r4) if r4 is not None else min(8, R)
     _Q0 = torch.randn(N_W, R, generator=torch.Generator().manual_seed(7)).to(DEV)
 
 
@@ -144,13 +153,25 @@ def _qr(Y):
 
 @torch.no_grad()
 def top_basis(S, iters=2):
-    """Top-r subspace of S (B,n,n) by randomized subspace iteration (matmul + QR).
-    No eigh. Detached: its gradient is a second-order effect."""
+    """Top-R subspace of S (B,n,n) by randomized subspace iteration, with a
+    Rayleigh-Ritz step so the columns come out ORDERED by eigenvalue.
+
+    Ordering matters: kappa4 uses a smaller rank than kappa3 and takes the first
+    R4 columns of this basis, which is only the dominant sub-subspace if the
+    columns are sorted. Detached (its gradient is a second-order effect)."""
     B = S.shape[0]
     Q = _Q0.expand(B, N_W, R).contiguous()
     for _ in range(iters):
         Q = _qr(torch.bmm(S, Q))
-    return Q
+    Sr = torch.bmm(Q.transpose(1, 2), torch.bmm(S, Q))       # (B, R, R)
+    Sr = 0.5 * (Sr + Sr.transpose(1, 2))
+    try:
+        w, U = torch.linalg.eigh(Sr)
+    except Exception:
+        w, U = torch.linalg.eigh(Sr.cpu())
+        w, U = w.to(S.device), U.to(S.device)
+    U = torch.flip(U, dims=[2])                              # descending eigenvalue
+    return torch.bmm(Q, U)
 
 
 def wick_cov(a, pdf, cdf, s, rho):
@@ -181,7 +202,7 @@ def closure(Ws, theta):
     S = torch.bmm(Ws[:, 0].transpose(1, 2), Ws[:, 0])
     V = top_basis(S)
     T3 = torch.zeros(B, R, R, R, device=DEV)
-    T4 = torch.zeros(B, R, R, R, R, device=DEV)
+    T4 = torch.zeros(B, R4, R4, R4, R4, device=DEV)   # kappa4: much smaller rank
     star = None                                   # (h2, h3, Wr, Bs) in z_l space
 
     for li in range(DEPTH):
@@ -200,13 +221,15 @@ def closure(Ws, theta):
         rho = torch.clamp(S / ss, -1.0, 1.0)
 
         # ---- cumulant slices: carried cores + full-fidelity fresh star
-        G2 = (V.unsqueeze(3) * V.unsqueeze(2)).reshape(B, N_W, R * R)      # (B,n,r^2)
-        P3 = torch.bmm(G2, T3.reshape(B, R * R, R))                        # (B,n,r)
+        G2 = (V.unsqueeze(3) * V.unsqueeze(2)).reshape(B, N_W, R * R)      # (B,n,R^2)
+        P3 = torch.bmm(G2, T3.reshape(B, R * R, R))                        # (B,n,R)
         k3_slice = torch.bmm(P3, V.transpose(1, 2))                        # (B,n,n)
         k3_diag = (P3 * V).sum(2)
-        P4 = torch.bmm(G2, T4.reshape(B, R * R, R * R))                    # (B,n,r^2)
-        k4_slice = torch.bmm(P4, G2.transpose(1, 2))                       # (B,n,n)
-        k4_diag = (P4 * G2).sum(2)
+        V4 = V[:, :, :R4]                                                  # dominant sub-basis
+        G2b = (V4.unsqueeze(3) * V4.unsqueeze(2)).reshape(B, N_W, R4 * R4)
+        P4 = torch.bmm(G2b, T4.reshape(B, R4 * R4, R4 * R4))               # (B,n,R4^2)
+        k4_slice = torch.bmm(P4, G2b.transpose(1, 2))                      # (B,n,n)
+        k4_diag = (P4 * G2b).sum(2)
         if star is not None:
             h2s, h3s, Wr, Bs = star
             C3 = h2s.unsqueeze(2) * Wr * Bs
@@ -254,10 +277,12 @@ def closure(Ws, theta):
         S = torch.bmm(W.transpose(1, 2), torch.bmm(Sig, W))
         V_next = top_basis(S)
 
-        Z = h1.unsqueeze(2) * torch.bmm(W, V_next)                 # (B,n,r)
-        M = torch.bmm(Z.transpose(1, 2), V)                        # (B,r,r): new <- old
+        Z = h1.unsqueeze(2) * torch.bmm(W, V_next)                 # (B,n,R)
+        M = torch.bmm(Z.transpose(1, 2), V)                        # (B,R,R): new <- old
+        M4 = M[:, :R4, :R4]                                        # kappa4's sub-basis map
         T3 = c["c3p"][li] * torch.einsum("bmkl,bam,bnk,bol->bano", T3, M, M, M)
-        T4 = c["c4p"][li] * torch.einsum("bmklp,bam,bnk,bol,bqp->banoq", T4, M, M, M, M)
+        T4 = c["c4p"][li] * torch.einsum("bmklp,bam,bnk,bol,bqp->banoq",
+                                         T4, M4, M4, M4, M4)
 
         if star is not None:                                       # compress the old star
             h2s, h3s, Wr, Bs = star
@@ -265,7 +290,8 @@ def closure(Ws, theta):
             Bv = torch.bmm(Bs, Z)
             U3 = torch.einsum("bi,bim,bik,bil->bmkl", h2s, A, Bv, Bv)
             T3 = T3 + c["c3g"][li] * (U3 + U3.permute(0, 2, 1, 3) + U3.permute(0, 2, 3, 1))
-            U4 = torch.einsum("bi,bim,bik,bil,bip->bmklp", h3s, A, Bv, Bv, Bv)
+            A4, Bv4 = A[:, :, :R4], Bv[:, :, :R4]
+            U4 = torch.einsum("bi,bim,bik,bil,bip->bmklp", h3s, A4, Bv4, Bv4, Bv4)
             T4 = T4 + c["c4g"][li] * (U4 + U4.permute(0, 2, 1, 3, 4)
                                       + U4.permute(0, 2, 3, 1, 4)
                                       + U4.permute(0, 2, 3, 4, 1))
@@ -321,7 +347,7 @@ def load_train(n_mlps, n_samples=1_000_000, chunk=16):
 
 def main():
     args = _parse()
-    set_rank(args.rank)
+    set_rank(args.rank, args.rank4)
 
     val_seeds, val_gt = load_val(args.val_mlps, args.val_samples)
     WV = make_ws(val_seeds)
@@ -341,8 +367,9 @@ def main():
     start_step, best = 1, (float("inf"), theta.detach().clone())
     if CKPT.exists() and not args.fresh:
         st = torch.load(CKPT, map_location=DEV)
-        if st.get("rank", R) != R:
-            print(f"checkpoint rank {st.get('rank')} != --rank {R}; use --fresh or match it")
+        if st.get("rank", R) != R or st.get("rank4", R4) != R4:
+            print(f"checkpoint ranks {st.get('rank')}/{st.get('rank4')} != "
+                  f"{R}/{R4}; use --fresh or match them")
             raise SystemExit(1)
         with torch.no_grad():
             theta.copy_(st["theta"])
@@ -367,7 +394,8 @@ def main():
 
     def save(step):
         torch.save({"theta": theta.detach().cpu(), "opt": opt.state_dict(), "step": step,
-                    "best_val": best[0], "best_theta": best[1].cpu(), "rank": R}, CKPT)
+                    "best_val": best[0], "best_theta": best[1].cpu(),
+                    "rank": R, "rank4": R4}, CKPT)
 
     print(f"training on {len(tr_seeds)} MLPs with exact targets "
           f"(Ctrl-C to stop; checkpointed every eval)\n")
