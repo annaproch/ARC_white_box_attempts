@@ -146,6 +146,7 @@ class Estimator(BaseEstimator):
         self._theta = None      # (depth, 13) calibrated K3/K4 closure coefficients
         self._rank = 0
         self._rank4 = 8
+        self._no_k4 = False
         self._q0 = None
         self._n_pts = 0         # QMC points to use alongside the closure
         self._w = None          # 3-way fusion weights [QMC, K2, K3K4], sum = 1
@@ -169,6 +170,7 @@ class Estimator(BaseEstimator):
                 self._n_pts = int(float(meta[1]))
                 self._w = [float(meta[2]), float(meta[3]), float(meta[4])]
                 self._rank4 = int(float(meta[5])) if meta.shape[0] >= 6 else 8
+                self._no_k4 = bool(float(meta[6]) > 0.5) if meta.shape[0] >= 7 else False
                 self._q0 = cp.q0
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
@@ -182,7 +184,8 @@ class Estimator(BaseEstimator):
         if (self._theta is not None and self._w is not None
                 and abs(self._w[0]) < 1e-6 and depth == self._theta.shape[0]):
             out = closure.predict_all_layers(mlp, self._theta, self._rank,
-                                             self._rank4, self._q0)
+                                             self._rank4, self._q0,
+                                             no_k4=self._no_k4)
             if out is not None:
                 chk = fnp.asarray(out, dtype=fnp.float64)
                 if (bool(fnp.all(fnp.isfinite(chk)))
@@ -197,7 +200,8 @@ class Estimator(BaseEstimator):
         analytic = None
         if self._theta is not None and shape_ok:
             analytic = closure.predict_final_mean(mlp, self._theta, self._rank,
-                                                  self._rank4, self._q0)
+                                                  self._rank4, self._q0,
+                                                  no_k4=self._no_k4)
             if analytic is not None:
                 chk = fnp.asarray(analytic, dtype=fnp.float64)
                 if not bool(fnp.all(fnp.isfinite(chk))) or float(fnp.max(fnp.abs(chk))) > 10.0:

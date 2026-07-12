@@ -40,9 +40,10 @@ ck = torch.load(DATA / "calib_k3k4.pt", map_location=DEV)
 theta = ck["best_theta"].to(DEV)
 rank = int(ck.get("rank", 16))
 rank4 = int(ck.get("rank4", min(8, rank)))
-K.set_rank(rank, rank4)
+no_k4 = bool(ck.get("no_k4", False))
+K.set_rank(rank, rank4, no_k4)
 print(f"checkpoint: step {ck['step']}, best val {ck['best_val']:.3e}, "
-      f"rank3 {rank} / rank4 {rank4}")
+      f"rank3 {rank} / rank4 {rank4}{' / kappa4 DROPPED' if no_k4 else ''}")
 
 # ---- held-out MLPs (disjoint from training and from the val set that picked theta)
 # CACHED: re-sampling the ground truth each run made the ship/no-ship decision
@@ -133,14 +134,16 @@ B_FLOP = 2.72e11
 PT_FLOP = DEPTH * (2 * N_W * N_W + 2 * N_W)          # per QMC point (validated)
 K2_FLOP = 2.2e9                                      # v4's calibrated-K2 closure
 RESID_FLOP = 1.7e9                                   # measured lambda * wall-time
-_CL_MEASURED = {(32, 8): 1.13e10}                    # (rank3, rank4) -> FLOPs
-CL_FLOP = _CL_MEASURED.get((rank, rank4))
-if CL_FLOP is None:                                  # crude scaling from the measured point
-    CL_FLOP = 1.13e10 * (14.0 * N_W ** 3 + 2.0 * N_W * rank ** 3
-                         + 2.0 * N_W * rank4 ** 4) / (
-        14.0 * N_W ** 3 + 2.0 * N_W * 32 ** 3 + 2.0 * N_W * 8 ** 4)
-    print(f"WARNING: closure cost for r3={rank},r4={rank4} is EXTRAPOLATED "
-          f"({CL_FLOP:.2e}). Measure it with `whest run` before trusting a win.")
+# MEASURED with flopscope (whest-starterkit/measure_flops.py), not estimated.
+_CL_MEASURED = {(32, 8, False): 1.135e10,     # kappa3 + kappa4
+                (32, 1, True): 8.65e9,        # kappa3 only
+                (64, 1, True): 2.73e10}       # kappa3 only, rank 64 (too expensive)
+CL_FLOP = _CL_MEASURED.get((rank, rank4, no_k4))
+if CL_FLOP is None:
+    raise SystemExit(f"closure cost for r3={rank}, r4={rank4}, no_k4={no_k4} has NOT "
+                     f"been measured. Measure it with flopscope before trusting any "
+                     f"sweep -- an estimate that was 2.7x low already lost one "
+                     f"submission.")
 CL_FLOP += RESID_FLOP
 V4_PTS = 6400
 V4_C = V4_PTS * PT_FLOP + K2_FLOP                    # ~2.9e10 = 10.9% (matches grader)
@@ -214,7 +217,8 @@ if s_best < s_v4 * 0.995:
     np.savez(KIT / "closure.npz",
              theta=theta.cpu().numpy().astype(np.float32),
              meta=np.array([float(rank), float(n_best),
-                            w3[0], w3[1], w3[2], float(rank4)], dtype=np.float32),
+                            w3[0], w3[1], w3[2], float(rank4),
+                            1.0 if no_k4 else 0.0], dtype=np.float32),
              # ship the subspace-iteration start block so the estimator builds the
              # SAME basis the coefficients were calibrated on
              q0=K._Q0.cpu().numpy().astype(np.float32),
