@@ -56,10 +56,14 @@ def _parse():
     # the MC target is an UNBIASED gradient signal at any batch size, so a small
     # x-batch just adds gradient noise -- and it dominates step cost. 2048 is ~4x
     # cheaper per step than 8192 and lets us take many more steps.
-    ap.add_argument("--x-batch", type=int, default=2048)
-    ap.add_argument("--steps", type=int, default=100_000)
+    ap.add_argument("--x-batch", type=int, default=2048)   # (unused: exact targets now)
+    ap.add_argument("--train-mlps", type=int, default=128)
+    ap.add_argument("--train-samples", type=int, default=1_000_000)
+    ap.add_argument("--steps", type=int, default=6000)
     ap.add_argument("--eval-every", type=int, default=50)
-    ap.add_argument("--lr", type=float, default=3e-3)
+    # lower LR + cosine decay: the old 3e-3 with a noisy target oscillated
+    # (best at step 600, then thrashing between 1.4e-5 and 3.5e-5).
+    ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--val-mlps", type=int, default=24)
     ap.add_argument("--val-samples", type=int, default=2_000_000)
     ap.add_argument("--export", action="store_true", help="export best params and exit")
@@ -286,12 +290,43 @@ def load_val(n_mlps=24, n_samples=2_000_000):
     return seeds, gt
 
 
+def load_train(n_mlps, n_samples=1_000_000, chunk=16):
+    """Fixed training corpus with ACCURATE targets.
+
+    Drawing a fresh MC target every step (2048 samples) gives per-neuron noise
+    ~sqrt(0.012/2048) = 2.4e-3, comparable to the error being minimised (~4e-3
+    rms) -- the gradient was mostly noise, so training oscillated instead of
+    converging. Precomputing accurate targets once fixes that AND removes the
+    per-step sampling, which dominated step cost.
+
+    416 params vs n_mlps*256 targets => overfitting is not a real risk, and the
+    held-out val set would reveal it anyway.
+    """
+    cache = DATA / f"train_gt_{n_mlps}.pt"
+    if cache.exists():
+        blob = torch.load(cache)
+        return blob["seeds"], blob["gt"].to(DEV)
+    seeds = list(range(500_000, 500_000 + n_mlps))
+    t0 = time.time()
+    gts = []
+    for i in range(0, n_mlps, chunk):
+        gts.append(mc_final(make_ws(seeds[i:i + chunk]), n_samples).cpu())
+        print(f"  train GT {min(i+chunk, n_mlps)}/{n_mlps} ({time.time()-t0:.0f}s)")
+    gt = torch.cat(gts)
+    torch.save({"seeds": seeds, "gt": gt, "n_samples": n_samples}, cache)
+    print(f"built training corpus: {n_mlps} MLPs x {n_samples:.0e} samples "
+          f"in {time.time()-t0:.0f}s")
+    return seeds, gt.to(DEV)
+
+
 def main():
     args = _parse()
     set_rank(args.rank)
 
     val_seeds, val_gt = load_val(args.val_mlps, args.val_samples)
     WV = make_ws(val_seeds)
+    tr_seeds, tr_gt = load_train(args.train_mlps, args.train_samples)
+    WT = make_ws(tr_seeds)     # (n_train, L, n, n) — kept on device, ~2 GB at 192
 
     @torch.no_grad()
     def val_mse(theta):
@@ -334,28 +369,30 @@ def main():
         torch.save({"theta": theta.detach().cpu(), "opt": opt.state_dict(), "step": step,
                     "best_val": best[0], "best_theta": best[1].cpu(), "rank": R}, CKPT)
 
-    print("training (Ctrl-C to stop; progress is checkpointed every eval)\n")
-    t0 = time.time()
+    print(f"training on {len(tr_seeds)} MLPs with exact targets "
+          f"(Ctrl-C to stop; checkpointed every eval)\n")
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=max(args.steps - start_step, 1), eta_min=args.lr * 0.02)
+    t0, step0 = time.time(), start_step
     for step in range(start_step, args.steps + 1):
-        seeds = torch.randint(3_000_000, 9_000_000, (args.batch_mlps,)).tolist()
-        Ws = make_ws(seeds)
-        with torch.no_grad():
-            target = mc_final(Ws, args.x_batch)
-        est = closure(Ws, theta)
-        loss = ((est * est).sum(1) - 2 * (est * target).sum(1)).mean()
+        idx = torch.randperm(len(tr_seeds))[: args.batch_mlps]
+        est = closure(WT[idx], theta)
+        loss = ((est - tr_gt[idx]) ** 2).mean()      # exact target: clean gradient
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_([theta], 1.0)
         opt.step()
+        sched.step()
 
         if step % args.eval_every == 0 or stop["flag"]:
             v = val_mse(theta.detach())
             if v < best[0]:
                 best = (v, theta.detach().clone())
             save(step)
-            rate = step / max(time.time() - t0, 1e-9)
-            print(f"step {step:6d}  val {v:.3e}  best {best[0]:.3e}  "
-                  f"({rate:.1f} steps/s)  [checkpointed]")
+            rate = (step - step0 + 1) / max(time.time() - t0, 1e-9)
+            print(f"step {step:6d}  train {float(loss):.3e}  val {v:.3e}  "
+                  f"best {best[0]:.3e}  lr {sched.get_last_lr()[0]:.1e}  "
+                  f"({rate:.1f} steps/s)")
         if stop["flag"]:
             print("\nstopped; state saved. Re-run to resume, "
                   "or run research/export_closure.py to ship the best params.")
