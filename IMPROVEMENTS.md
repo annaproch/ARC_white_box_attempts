@@ -238,12 +238,54 @@ numbers below are real, not artifacts.
 **Consequence for the build: mean and covariance must be corrected TOGETHER,
 and the mean path is the priority.** Partial fixes are actively harmful.
 
-Next: `step_unit_test.py` — feed the true pre-activation moments (μ_z, Σ_z,
-κ₃(z), κ₄(z)) into a **single** ReLU step and compare against the true
-post-activation μ/Σ of that layer. This isolates the step from the compounding
-dynamics and validates each correction's coefficient and sign independently. A
-term that increases the single-step error has a wrong sign — and every
-end-to-end result built on it is meaningless.
+## SINGLE-STEP UNIT TEST — THE FORMULAS ARE RIGHT (`step_unit_test.py`, 8 MLPs)
+
+True pre-activation moments in, one ReLU step, compared against that layer's
+true post-activation moments (no propagation, no compounding, no cancellation):
+
+| layer | mean: Gaussian | +κ₃ | **+κ₃+κ₄** | cov: Gaussian | +κ₃ | **+κ₃+κ₄** |
+|---|---|---|---|---|---|---|
+| L1 | 2.6e-6 | 3.1e-7 | **3.8e-9** (692×) | 1.1e-5 | 3.1e-7 | **4.3e-8** (260×) |
+| L3 | 4.9e-6 | 5.5e-7 | **3.8e-9** (1298×) | 1.4e-5 | 2.6e-7 | **7.5e-8** (193×) |
+| L15 | 3.2e-6 | 4.2e-7 | **1.8e-8** (173×) | 8.2e-6 | 6.7e-8 | **6.2e-8** (133×) |
+| L31 | 1.1e-6 | 2.1e-7 | **4.6e-8** (23×) | 1.5e-6 | 3.6e-8 | **3.6e-8** (42×) |
+
+**Every correction reduces its step error at every depth ⇒ signs and
+coefficients are correct.** And **κ₄ is not optional**: it buys another ~145×
+on the mean *after* κ₃.
+
+This also explains the paradoxical oracle: we injected **true** cumulants into
+a **drifted** state (our propagated μ, Σ). A cumulant correction is only valid
+for the distribution it belongs to — pairing truth with a drifted state is
+inconsistent, which is worse than K=2's self-cancelling fixed point. Propagate
+consistently and the L31 row projects a final-layer error of **~5e-8 — below
+the competitor's 3.2e-7.**
+
+## THE BUILD: compute κ₃(z) analytically at O(n³) — no tensors
+
+κ₃ of the activations is **structured**, not arbitrary. Leading order (star
+diagrams):
+
+    κ₃(a)_ijk = h₂(i)h₁(j)h₁(k)·Σ_ij·Σ_ik + (i↔j) + (i↔k)
+
+and after the linear map the *slice we need* collapses to three matmuls:
+
+    B = Σ·diag(h₁)·W
+    C_ip = h₂(i)·W_ip·B_ip ,   D_ip = h₂(i)·B_ip²
+    κ₃(z')_ppq = 2·(CᵀB)_pq + (DᵀW)_pq          ← O(n³), ~5e7 FLOPs/layer
+
+i.e. ~1.6e9 FLOPs total — comfortably inside the floor, and **no n³ tensor is
+ever materialized**. (My earlier "n² slices can't propagate" retraction stands
+for arbitrary tensors; the point is that κ₃(a) is *generated* by a ReLU acting
+on a near-Gaussian, so it has closed form.)
+
+Two terms remain to be priced (`analytic_k3_test.py`):
+- **triangle** `h₂h₂h₂·Σ_ij Σ_jk Σ_ki` — O(n⁴) exactly, but O(n²r²) with a
+  rank-r truncation of Σ (justified: eig1frac 0.5–0.8).
+- **pass-through** `h₁h₁h₁·κ₃(z)_ijk` — the incoming third cumulant carried
+  forward. **This is the term that forces a factored tensor, and it is exactly
+  why ARC's implementation costs 40× the budget.** If it turns out to be
+  subleading at this depth, we get K=3-class accuracy at K=2 cost.
 
 ## The plan
 
