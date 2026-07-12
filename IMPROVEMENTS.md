@@ -208,6 +208,43 @@ the true Σ at every layer: 32 × 65k targets per MLP, versus the 256 numbers of
 final-layer MSE we have been squeezing gradients from — the likely cause of
 every plateau so far).
 
+## ORACLE RESULT — K=2 IS A SELF-CONSISTENT FIXED POINT (the day's key finding)
+
+Corpus validated: `oracle-ALL` (true μ *and* Σ injected every layer) = **1.06e-6**,
+matching the independently measured Gaussian-shape error (1.0e-6). So the
+numbers below are real, not artifacts.
+
+| variant | final-layer MSE |
+|---|---|
+| K=2 (baseline) | 1.30e-4 |
+| K=2 + **true** κ₃(z) corrections (mean + covariance) | 1.72e-4 ❌ worse |
+| K=2 + true κ₃ + κ₄ | 1.61e-4 ❌ worse |
+| **oracle-cov** (true Σ every layer, propagated μ) | **1.89e-4** ❌ worse |
+| oracle-ALL (true μ and Σ every layer) | 1.06e-6 ✅ |
+
+**Interpretation.** With a *perfect* covariance the mean still accumulates
+1.9e-4 of error — worse than K=2's total. So:
+
+1. The per-layer **mean update carries a systematic shape bias that compounds
+   over 32 layers**, and it — not the covariance — is the dominant error source.
+2. **K=2's covariance underestimate partially cancels that mean bias.** The
+   closure is a self-consistent fixed point. Improving *either* component in
+   isolation — even to perfection — destroys the cancellation and makes the
+   final answer worse.
+3. This retro-explains every plateau: our calibrations (±5%, ±60%, rank-1 core)
+   were being rewarded for *preserving the cancellation*, not for fixing physics.
+   It also explains why a scalar off-diagonal boost couldn't help.
+
+**Consequence for the build: mean and covariance must be corrected TOGETHER,
+and the mean path is the priority.** Partial fixes are actively harmful.
+
+Next: `step_unit_test.py` — feed the true pre-activation moments (μ_z, Σ_z,
+κ₃(z), κ₄(z)) into a **single** ReLU step and compare against the true
+post-activation μ/Σ of that layer. This isolates the step from the compounding
+dynamics and validates each correction's coefficient and sign independently. A
+term that increases the single-step error has a wrong sign — and every
+end-to-end result built on it is meaningless.
+
 ## The plan
 
 1. **[done] Error attribution at the final ReLU** (`error_attribution.py`).
