@@ -67,11 +67,49 @@ baseline. A top-10 competitor's per-MLP detail (submission tooltip,
 - **G5 — wasted effort on unscored layers.** Only L31 is ranked. Intermediate
   accuracy is worth zero.
 
+## G1 — TESTED AND DEAD (`wick_terms_test.py`)
+
+Off-diagonal |ρ| **grows with depth** exactly as predicted (mean 0.05 → 0.26,
+p95 0.60, **max 0.90** at L31) — but the Wick series is **fully converged by
+k=4**: mean MSE 5.954e-5 (k=2), 5.959e-5 (k=4 … k=64), identical to 4 digits.
+The ρ^k/k! weighting plus the decay of ReLU's Hermite coefficients kills the
+tail even at ρ = 0.9. **Truncation was never our problem** — the whole ~6e-5
+error of plain K=2 is the *Gaussian closure itself* (discarding 3rd+
+cumulants), not its numerics.
+
+## The sharper puzzle this creates
+
+Our own measurements: paper's factorized K=3 at depth 32 → **2.3e-5**;
+K=3-augmented (at 4× the entire budget) → **1.8e-6**. The competitor gets
+**3.2e-7 at the floor**. So they are **not running textbook kprop at any
+order** — no K in the paper's family reaches their accuracy at any budget we
+measured. Something structurally different is happening, and we must locate
+our error before building anything expensive.
+
 ## The plan
 
-1. **[hours] Fix G1.** Crank the Wick series 2 → 20–40 terms in the calibrated
-   K=2 and re-measure held-out MSE. Decisive, tiny change to existing code:
-   if MSE drops sharply, truncation was our 10×.
+1. **[now] Error attribution at the final ReLU** (`error_attribution.py`).
+   The final estimate is g(μ̂,σ̂) = σ̂φ(α̂)+μ̂Φ(α̂) on the final pre-activation z.
+   Exactly three error sources: (A) wrong propagated moments (μ̂,σ̂), (B) the
+   Gaussian *shape* assumption about z (z is skewed), (C) interaction.
+   Sampling gives true μ_z, σ_z, skew(z) and true E[ReLU(z)], so we price each:
+   - **shape (B) dominates** → fix the 1-D marginal of z (Edgeworth /
+     Gauss–Hermite quadrature on the tracked skew). Cheap, no tensor
+     propagation — and it would explain how someone hits 3.2e-7 at the floor.
+   - **moments (A) dominate** → the upstream moments are wrong → rank-r K=3.
+   The script also reports the last hidden layer's covariance spectrum
+   (top-eigenvalue share), which sizes the "non-Gaussian core + Gaussian
+   remainder" closure below.
+
+2. **Candidate closure if the core is low-rank** (deduction–projection made
+   concrete): deep ReLU covariance is dominated by a **common mode**. Write
+   z = μ + U c + ε with c ∈ R^r *non-Gaussian* (tracked by a small quadrature
+   grid / its moments) and ε Gaussian. Then
+   E[ReLU(z_i)] = E_c[ σ_ε,i φ(α_i(c)) + m_i(c) Φ(α_i(c)) ],
+   evaluated by Q-node quadrature over c: O(Q·n²) per layer — cheap, and a
+   *lot* of small elementwise ops (matching the competitor's 1.1 GFLOP/s
+   wall-time signature). This captures the dominant non-Gaussianity (the
+   radial/scale fluctuation) that a Gaussian closure structurally cannot.
 2. **[hours] Fix G2.** Swap in the exact bivariate ReLU second moment
    (arc-cosine / Owen's T) — removes the series entirely.
 3. **[days] Fix G3 — the real prize.** Fixed-rank factored third cumulant
