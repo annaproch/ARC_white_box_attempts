@@ -625,13 +625,19 @@ is highest — which points at the next lever.
 
 Ranked improvements for the fused architecture:
 
-1. **Per-MLP adaptive fusion weight** (v4.1 candidate, validating now):
-   per-MLP QMC variance v_m spans ~25×, and is estimable from the existing
-   6400 samples to ~2% relative error at ~3e6 FLOPs (free). Set
-   w_m = v̂_m/(v̂_m + b²) with only b² global. High-variance (tail) MLPs get
-   w up to ~0.4 instead of 0.137 → projected −25% on tail MLPs, −5–8% mean.
-   Unlike the failed per-*neuron* fusion, the per-MLP steering signal is far
-   above its own noise — this resolves the earlier no-go's premise.
+1. **Per-MLP adaptive fusion weight — tested and rejected, with a clean
+   explanation.** Naive w_m = v̂_m/(v̂_m + b²_global) is much *worse* than
+   global w (val mean 4.10e-6 vs 2.97e-6; worst MLP 2.85e-5 vs 6.9e-6):
+   the analytic bias is not constant across MLPs — **it co-scales with the
+   sampling variance** (measured corr(log b²_m, log v̂_m) = +0.58, log-log
+   slope 0.61, median b²/v̂ ≈ 2.9), because both are driven by the network's
+   overall activation scale. Co-scaling ⇒ the optimal MLP-level weight is
+   ~constant ⇒ v4's global w is already the right rule, and adaptivity
+   over-trusts an equally-degraded analytic estimate exactly on the tail
+   MLPs. (A power-law-regularized w_m(v̂) from the slope-0.61 fit is the
+   only surviving variant — projected worth ≤ 2–3%; parked.) This completes
+   the trilogy: per-neuron adaptivity fails (noise), per-MLP adaptivity
+   fails (co-scaling), global offline weights are the sound level.
 2. **Lower b² compounds with #1** (all w_m rise). K=2.5 gave only −2.3%;
    next real step is tier 3.
 3. **Train θ and w jointly against the fused objective** (θ currently
