@@ -53,6 +53,11 @@ def _parse():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rank", type=int, default=32)      # kappa3 rank
     ap.add_argument("--rank4", type=int, default=8)      # kappa4 rank (cost ~ n r^4)
+    ap.add_argument("--no-k4", action="store_true",
+                    help="drop kappa4 entirely: its propagation is WORSE than predicting "
+                         "zero (rel. err 2.5, and worse at higher rank) because it omits "
+                         "the leading kappa3-mixed diagrams. exp(1.5 tanh) cannot reach 0, "
+                         "so calibration can never switch it off by itself.")
     ap.add_argument("--batch-mlps", type=int, default=8)
     # the MC target is an UNBIASED gradient signal at any batch size, so a small
     # x-batch just adds gradient noise -- and it dominates step cost. 2048 is ~4x
@@ -82,6 +87,7 @@ def _parse():
 # basis, i.e. kappa4 lives in kappa3's dominant sub-subspace.
 R = 16      # kappa3 rank
 R4 = 8      # kappa4 rank (<= R)
+NO_K4 = False
 
 # 13 params/layer: [p, q, moff, s_dia, s_off, c3m, c3c, c3g, c3p, c4m, c4c, c4g, c4p]
 NP = 13
@@ -133,9 +139,10 @@ def mc_final(Ws, n_samples, chunk=16384):
 _Q0 = torch.randn(N_W, R, generator=torch.Generator().manual_seed(7)).to(DEV)
 
 
-def set_rank(r, r4=None):
+def set_rank(r, r4=None, no_k4=False):
     """Set the kappa3 rank (and kappa4's, defaulting to min(8, r))."""
-    global R, R4, _Q0
+    global R, R4, _Q0, NO_K4
+    NO_K4 = bool(no_k4)
     R = int(r)
     R4 = int(r4) if r4 is not None else min(8, R)
     _Q0 = torch.randn(N_W, R, generator=torch.Generator().manual_seed(7)).to(DEV)
@@ -227,9 +234,13 @@ def closure(Ws, theta):
         k3_diag = (P3 * V).sum(2)
         V4 = V[:, :, :R4]                                                  # dominant sub-basis
         G2b = (V4.unsqueeze(3) * V4.unsqueeze(2)).reshape(B, N_W, R4 * R4)
-        P4 = torch.bmm(G2b, T4.reshape(B, R4 * R4, R4 * R4))               # (B,n,R4^2)
-        k4_slice = torch.bmm(P4, G2b.transpose(1, 2))                      # (B,n,n)
-        k4_diag = (P4 * G2b).sum(2)
+        if NO_K4:
+            k4_slice = torch.zeros_like(k3_slice)
+            k4_diag = torch.zeros_like(k3_diag)
+        else:
+            P4 = torch.bmm(G2b, T4.reshape(B, R4 * R4, R4 * R4))           # (B,n,R4^2)
+            k4_slice = torch.bmm(P4, G2b.transpose(1, 2))                  # (B,n,n)
+            k4_diag = (P4 * G2b).sum(2)
         if star is not None:
             h2s, h3s, Wr, Bs = star
             C3 = h2s.unsqueeze(2) * Wr * Bs
@@ -237,11 +248,12 @@ def closure(Ws, theta):
             k3_slice = k3_slice + 2.0 * torch.bmm(C3.transpose(1, 2), Bs) \
                                 + torch.bmm(D3.transpose(1, 2), Wr)
             k3_diag = k3_diag + 3.0 * (h2s.unsqueeze(2) * Wr * Bs * Bs).sum(1)
-            C4 = h3s.unsqueeze(2) * Wr * Bs
-            D4 = h3s.unsqueeze(2) * Bs * Bs
-            k4_slice = k4_slice + 2.0 * torch.bmm(C4.transpose(1, 2), Bs * Bs) \
-                                + 2.0 * torch.bmm(D4.transpose(1, 2), Wr * Bs)
-            k4_diag = k4_diag + 4.0 * (h3s.unsqueeze(2) * Wr * Bs * Bs * Bs).sum(1)
+            if not NO_K4:
+                C4 = h3s.unsqueeze(2) * Wr * Bs
+                D4 = h3s.unsqueeze(2) * Bs * Bs
+                k4_slice = k4_slice + 2.0 * torch.bmm(C4.transpose(1, 2), Bs * Bs) \
+                                    + 2.0 * torch.bmm(D4.transpose(1, 2), Wr * Bs)
+                k4_diag = k4_diag + 4.0 * (h3s.unsqueeze(2) * Wr * Bs * Bs * Bs).sum(1)
 
         # ---- corrections in DIMENSIONLESS form: divide the cumulants by their
         # sigma powers FIRST, then multiply by the bounded (phi, Phi) factors.
@@ -355,7 +367,7 @@ def load_train(n_mlps, n_samples=1_000_000, chunk=16):
 
 def main():
     args = _parse()
-    set_rank(args.rank, args.rank4)
+    set_rank(args.rank, 1 if args.no_k4 else args.rank4, args.no_k4)
 
     val_seeds, val_gt = load_val(args.val_mlps, args.val_samples)
     WV = make_ws(val_seeds)
@@ -403,7 +415,7 @@ def main():
     def save(step):
         torch.save({"theta": theta.detach().cpu(), "opt": opt.state_dict(), "step": step,
                     "best_val": best[0], "best_theta": best[1].cpu(),
-                    "rank": R, "rank4": R4}, CKPT)
+                    "rank": R, "rank4": R4, "no_k4": NO_K4}, CKPT)
 
     print(f"training on {len(tr_seeds)} MLPs with exact targets "
           f"(Ctrl-C to stop; checkpointed every eval)\n")

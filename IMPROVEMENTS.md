@@ -263,6 +263,91 @@ the competitor's 3.2e-7.**
 
 ---
 
+# 📜 THE COMPLETE HISTORY — every idea, what happened, why
+
+Chronological. Includes the mistakes, because most of the learning is in them.
+
+## Phase 1 — Sampling (v1 → v3): finding the floor
+
+| # | idea | outcome |
+|---|---|---|
+| 1 | Read the challenge paper (arXiv:2605.05179), port ARC's kprop | K≥3 **exceeds the budget** at depth 32 (114%/420%); K=2 gives 4.7e-5 — 10× worse than sampling at the floor. The paper's methods were tested at ≤12 layers; depth 32 changes everything. |
+| 2 | **Monte Carlo at the compute floor** | The multiplier `max(0.1, C/B)` makes compute below 10% free. iid MC at the floor: **6.53e-7 = exactly the MC reference.** v1. |
+| 3 | Antithetic pairs (x, −x) | **No gain.** After 32 ReLU layers the output has almost no odd dependence on the input. (This also killed the linearized `J·x` control variate before we built it.) |
+| 4 | Scrambled **Sobol → Gaussian, moment-matched** | 3.2× better than iid. **v2: 3.78e-7 (1.7× vs MC).** |
+| 5 | **Spherical projection** (no biases ⇒ 1-homogeneous ⇒ radial integral exact) | Free and exact. **v3: 3.69e-7.** |
+| 6 | Learned quadrature weights (ridge/Bayesian) | **Collapse to uniform** (<2%). Sobol+mm is already ≈ BQ-optimal. |
+| 7 | SGD-optimized point positions | **Noise-level** (+2%), then degrades. Gradient noise destroys the Sobol structure. |
+| 8 | Trim points to duck under the 10% floor (v3.1) | **Made it worse** — and predicted the public score to 4 digits. **The floor is not a cliff**: above it the multiplier is linear and MSE is ~linear in 1/N, so the score surface is flat to first order. |
+| 9 | Measure QMC's convergence exponent | **β ≈ 0.83 < 1** ⇒ never leave the floor. |
+
+## Phase 2 — Fusion (v4): cumulants earn a place
+
+| # | idea | outcome |
+|---|---|---|
+| 10 | Per-**neuron** fusion of MC + analytic | **Fails.** The per-neuron bias signal is `(mc − analytic)`, whose detection noise *is* the MC noise. Oracle weights give only 1.37×. |
+| 11 | Per-**MLP** adaptive fusion weight | **Fails.** Analytic bias **co-scales** with sampling variance (corr(log b², log v̂) = +0.58) — both driven by activation scale — so the optimal weight is ~constant. |
+| 12 | **Global offline-learned fusion weight** | Works. This is the sound level of adaptivity. |
+| 13 | **End-to-end calibrated K=2 closure** (192 learned per-layer scalars, backprop through 32 layers) | Removes **66%** of the Gaussian-closure error (7.2e-5 → 2.4e-5). |
+| 14 | Fuse QMC + calibrated-K2 (w = 0.137, errors independent: corr −0.04) | **v4: 3.396e-7 (1.9× vs MC).** Still the best submission. |
+
+## Phase 3 — Competitor analysis: the pivot
+
+| # | finding | evidence |
+|---|---|---|
+| 15 | A top-10 rival is **pure analytic** | Their intermediate layers are garbage (~0.5 MSE — sampling would give them free), 8.5% budget, **21 s wall time at 1.1 GFLOP/s** = thousands of small elementwise ops = cumulant machinery. |
+| 16 | **21 s of wall time is allowed** | Only *residual* (non-flopscope) time is charged at λ. We had been far too conservative. |
+| 17 | They achieve ~3.2e-7 raw, ~10× better than us at the same compute | And **no kprop variant in the paper reaches that at any budget** — so they are not running textbook cumulant propagation either. |
+
+## Phase 4 — Diagnosis: where the error actually lives
+
+| # | experiment | result |
+|---|---|---|
+| 18 | Wick-series truncation (k = 2 → 64) | **Converged by k=4** despite ρ reaching 0.90. Truncation was never the problem. |
+| 19 | Error attribution at the final ReLU | **98% is propagated-moment error**, 1.7% is the Gaussian *shape* assumption. z₃₁ is Gaussian (skew 0.02) — Edgeworth on the marginal is worthless. |
+| 20 | Layerwise covariance drift | λ₁ **underestimated 27–43%**; the dominant eigenmode is strongly **non-Gaussian** (skew 0.3–0.5) while carrying 50–83% of the variance. |
+| 21 | Rank-1 non-Gaussian "core" closure | **1.06× — fails.** The drift accumulates over layers 2–11, where eig1frac is only 0.03–0.27: the covariance is *not* rank-1 dominated where the error is made. |
+| 22 | Wide-bound scalar calibration (±5% → ±60%) | **Same plateau (2.6e-5).** A uniform scaling cannot reproduce a κ₃ correction that is *not* proportional to Σ_ij. Shape limitation, not capacity. |
+| 23 | **Oracle: inject true Σ at every layer** | **WORSE than K=2** (1.9e-4 vs 1.3e-4). **K=2 is a self-consistent fixed point** — its covariance underestimate partially cancels the mean's accumulated shape bias. **Partial fixes are actively harmful.** This retro-explains every plateau. |
+| 24 | Single-step unit test (true cumulants, one layer) | mean error 4.9e-6 → **3.8e-9** (1300×); covariance 1.4e-5 → 7.5e-8 (193×). **κ₄ is worth another 145× after κ₃.** The correction *formulas* are right. |
+
+## Phase 5 — Building the cumulant closure
+
+| # | idea | outcome |
+|---|---|---|
+| 25 | κ₃'s freshly-generated part has a **closed form** (star diagrams) | Exact: corr **0.996** at L1, computable in 3 matmuls — no n³ tensor. |
+| 26 | But the star **decays 26×** by L31 while true κ₃ stays constant | The **accumulated** κ₃ dominates at depth — that is the term that forces ARC's factored tensor and its L² cost. |
+| 27 | Is the accumulated κ₃ low-rank? | **Yes at depth** (top-1 SVD energy 0.98, aligned 0.998 with Σ's top eigenvector) — but *not* early (rank-1 corr 0.09 at L1). |
+| 28 | **Hybrid: exact star + rank-r Tucker core** | Works. κ₃ corr 0.94–0.97 vs sampled truth. **K=2 → +κ₃ = 4.7× (1.30e-4 → 2.76e-5).** |
+| 29 | (bug) compressing the star **at birth** | Threw away ~80% of its energy. Fixed: use it at full fidelity in the layer it lands, compress only when carried past. |
+| 30 | End-to-end calibration of the whole closure | 4.0e-5 → **1.05e-5**. Plateaus there in *every* configuration (r=16, 32; r₄=1, 8, 32). |
+
+## Phase 6 — The grader teaches us three lessons
+
+| # | mistake | lesson |
+|---|---|---|
+| 31 | Shipped 3-way fusion → **100/100 MLPs failed** | flopscope **infers a symmetry tag from einsum's repeated operands** and rejects the result. An individual star term is symmetric only in (k,l); *only the sum of three* is fully symmetric. Fix: build with matmul + reshape. |
+| 32 | I "fixed" the symmetrization first | **It was a no-op.** I misread torch's `permute` semantics. The uncalibrated value came back bit-identical, which is what caught it. |
+| 33 | 3-way shipped → **score 4.74e-7, LOST to v4** | My analytic FLOP estimate was **2.7× too low** (4.16e9 vs measured **1.13e10**). I counted the Tucker cores and forgot the matmuls that dominate (~14n³/layer, not 6). **Never trust an analytic FLOP estimate — measure it.** |
+
+## Phase 7 — The layerwise fit: the real diagnosis
+
+| # | experiment | result |
+|---|---|---|
+| 34 | **Least-squares fit of the moment corrections** with true cumulants injected (the coefficients enter *linearly* — no SGD needed) | mean step → **2.5e-9** (1854×), covariance → 6.4e-8 (220×), and the fitted coefficients land at **c3m ≈ 1.01, c3c ≈ 0.98** — my theory was right. **The correction machinery is not the bottleneck.** |
+| 35 | **Supervise the cumulant propagation** directly against sampled κ₃/κ₄ | κ₃ relative error **7.7% → 6.7%** (structural, not a scaling problem). **κ₄: 2.54 — worse than predicting zero**, and *worse at higher rank* (3.18 at r₄=32). |
+| 36 | κ₄ chain diagram (same Σ-edge order as the star) | **Barely helps** (2.54 → 2.52). |
+| 37 | **Why κ₄ is broken** | It omits the **κ₃-mixed diagrams** (`ĥ₂ĥ₁ĥ₁ĥ₁·κ₃(z)·Σ`), which are the **same order** as the star we do compute. Not a coefficient error — a structurally missing family. |
+| 38 | κ₃ error vs rank | r=8: 24% · r=16: 14% · r=32: 7.7% · r=64: 5.7% · r=96: 4.7%. Rank-limited, diminishing. |
+
+## Where that leaves the numbers
+
+The closure's error decomposes cleanly: **corrections are exact; κ₃ is 6.7% wrong; κ₄ is worse than zero.** A 6.7%-wrong κ₃ leaves 6.7% of each layer's correction unapplied, compounding over 32 layers into ≈1e-5 — which is exactly the plateau we measured in every configuration.
+
+**To beat v4 the closure needs MSE < ~4e-6 (≈3× better).** That 3× is precisely what a *working* κ₄ is worth (the unit test measured 145× on the mean step). Everything else — rank, coefficients, Wick terms — is already squeezed.
+
+---
+
 # ROUND 8 — THE CLOSURE SHIPS, AND WHAT IT COST US TO LEARN
 
 ## Leaderboard state
