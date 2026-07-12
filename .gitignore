@@ -17,3 +17,6 @@ __pycache__/
 .claude/
 .DS_Store
 whest-starterkit/.git-upstream/
+
+# sampled moment corpus (large, regenerable)
+data/
