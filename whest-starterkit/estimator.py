@@ -131,9 +131,10 @@ class Estimator(BaseEstimator):
     def __init__(self) -> None:
         self._setup_rng = None  # set from ctx.seed inside setup()
         self._points = None
-        self._theta = None      # (depth, 13) calibrated closure coefficients
+        self._theta = None      # (depth, 13) calibrated K3/K4 closure coefficients
         self._rank = 0
-        self._w_fuse = 0.0      # 0 => pure QMC (v4 behaviour); set offline
+        self._n_pts = 0         # QMC points to use alongside the closure
+        self._w = None          # 3-way fusion weights [QMC, K2, K3K4], sum = 1
 
     def setup(self, ctx) -> None:
         self._setup_rng = fnp.random.default_rng(ctx.seed)
@@ -146,41 +147,45 @@ class Estimator(BaseEstimator):
         if (d / CLOSURE_FILE).exists():
             cp = ClosureParams.from_file(str(d / CLOSURE_FILE))
             meta = fnp.asarray(cp.meta)
-            w = float(meta[1])
-            if w > 0.0:                       # a zero weight means "don't run it"
+            # [rank, n_pts, w_qmc, w_k2, w_k3k4]; written only when the offline
+            # held-out fit says the 3-way beats v4 on SCORE (accuracy x compute).
+            if meta.shape[0] >= 5:
                 self._theta = cp.theta
                 self._rank = int(float(meta[0]))
-                self._w_fuse = w
+                self._n_pts = int(float(meta[1]))
+                self._w = [float(meta[2]), float(meta[3]), float(meta[4])]
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         width, depth = mlp.width, mlp.depth
+        pts = self._points
+        have_pts = pts is not None and pts.shape[1] == width
+        shape_ok = depth == len(_THETA) and have_pts
 
-        # The analytic closure (K=2 + kappa3 + kappa4) is the accuracy engine; QMC
-        # is the variance-limited safety net. w_fuse is fitted offline on held-out
-        # MLPs, so a weak closure simply gets a small weight and cannot regress us.
-        # Budget is allocated to QMC *after* reserving the closure's cost.
+        # Three-way fusion when calibrated params shipped: QMC + calibrated-K2 +
+        # the K3/K4 closure. Weights and the QMC point count are fitted offline on
+        # held-out MLPs against the SCORE (accuracy x compute), and the file is
+        # only written when that beats v4 -- so this path cannot regress us.
         analytic = None
-        if self._theta is not None:
+        if self._theta is not None and shape_ok:
             analytic = closure.predict_final_mean(mlp, self._theta, self._rank)
             if analytic is not None:
                 chk = fnp.asarray(analytic, dtype=fnp.float64)
                 if not bool(fnp.all(fnp.isfinite(chk))) or float(fnp.max(fnp.abs(chk))) > 10.0:
                     analytic = None            # never ship a diverged closure
 
-        w_a = self._w_fuse if analytic is not None else 0.0
         # Per-sample cost: matmul (2n^2) + relu (n) + mean accumulation (n) per layer.
         flops_per_sample = depth * (2 * width * width + 2 * width)
-        closure_flops = _closure_flops(width, depth, self._rank) if analytic is not None else 0
-        sample_budget = max(self._BUDGET_FRACTION * budget - closure_flops, 0.0)
-
-        pts = self._points
-        if pts is not None and pts.shape[1] == width:
-            n = max(min(int(sample_budget / flops_per_sample), pts.shape[0]), 1)
+        if have_pts:
+            n = max(min(int(self._BUDGET_FRACTION * budget / flops_per_sample),
+                        pts.shape[0]), 1)
+            if analytic is not None and self._n_pts > 0:
+                n = min(n, self._n_pts)        # pay for the closure with QMC points
             x = pts[:n]
         else:
             # Fallback for shapes the shipped points don't cover (+16 FLOPs/elem RNG).
             rng = fnp.random.default_rng(mlp.seed)
-            n = max(int(sample_budget / (flops_per_sample + 16 * width)), 1)
+            n = max(int(self._BUDGET_FRACTION * budget
+                        / (flops_per_sample + 16 * width)), 1)
             x = rng.standard_normal((n, width)).astype(fnp.float32)
 
         rows = []
@@ -188,15 +193,16 @@ class Estimator(BaseEstimator):
             x = fnp.maximum(fnp.matmul(x, w), 0.0)
             rows.append(fnp.mean(x, axis=0))
 
-        if w_a >= 1.0:                          # pure analytic
-            rows[-1] = analytic
-        elif w_a > 0.0:                         # fuse the (only scored) final layer
-            rows[-1] = (1.0 - w_a) * rows[-1] + w_a * analytic
-        elif depth == len(_THETA) and pts is not None and pts.shape[1] == width:
-            # v4 fallback: fuse with the older calibrated-K2 closure.
+        if shape_ok:
             k2 = self._calibrated_k2_final(mlp)
             k2_np = fnp.asarray(k2, dtype=fnp.float64)
-            if bool(fnp.all(fnp.isfinite(k2_np))) and float(fnp.max(fnp.abs(k2_np))) < 10.0:
+            k2_ok = (bool(fnp.all(fnp.isfinite(k2_np)))
+                     and float(fnp.max(fnp.abs(k2_np))) < 10.0)
+            if analytic is not None and k2_ok and self._w is not None:
+                wq, wk2, wc = self._w
+                rows[-1] = wq * rows[-1] + wk2 * k2 + wc * analytic
+            elif k2_ok:
+                # v4: QMC + calibrated-K2 at the offline-fitted weight.
                 rows[-1] = (1.0 - _W_K2) * rows[-1] + _W_K2 * k2
         return fnp.stack(rows, axis=0)
 
