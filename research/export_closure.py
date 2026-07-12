@@ -126,38 +126,46 @@ s_v4 = score(mse_v4, V4_C)
 print(f"\nv4 (QMC{V4_PTS} + K2): mse {mse_v4:.3e}  C {V4_C:.2e} "
       f"({V4_C/B_FLOP:.1%})  score {s_v4:.3e}   <- to beat")
 
-# 3-way, holding TOTAL compute at v4's level: pay for the closure with QMC points
+# Sweep BOTH the point count and whether K2 is worth its 2.2e9 FLOPs.
+# The closure supersedes K2 (same covariance propagation + cumulants), so paying
+# for both is paying twice for the same thing -- that is what pushed us to 19%.
+print("\nsweep (score = mse x max(0.1, C/B); compute must come back near the floor):")
 best = None
-for n_pts in (6400, 5800, 5200, 4600, 4000):
-    C = n_pts * PT_FLOP + K2_FLOP + CL_FLOP
+qmc_cache = {}
+for n_pts in (6400, 6000, 5600, 5200, 4800, 4400, 4000, 3600):
     x = pts[:n_pts].unsqueeze(0).expand(len(seeds), -1, -1).contiguous()
     for li in range(DEPTH):
         x = torch.relu(torch.bmm(x, Ws[:, li]))
     e_qn = x.mean(1) - gt
-    E = np.stack([e_qn.cpu().numpy().ravel(), e_k2.cpu().numpy().ravel(),
-                  e_c.cpu().numpy().ravel()])
-    w = min_var_weights(E)
-    m = mse(w[0] * e_qn + w[1] * e_k2 + w[2] * e_c)
-    s = score(m, C)
-    print(f"  QMC{n_pts:5d}+K2+closure: mse {m:.3e}  C {C:.2e} ({C/B_FLOP:5.1%})  "
-          f"score {s:.3e}   w = [{w[0]:+.2f} {w[1]:+.2f} {w[2]:+.2f}]")
-    if best is None or s < best[0]:
-        best = (s, n_pts, w, m, C)
+    qmc_cache[n_pts] = e_qn
+    for use_k2 in (False, True):
+        C = n_pts * PT_FLOP + CL_FLOP + (K2_FLOP if use_k2 else 0.0)
+        cols = [e_qn, e_c] + ([e_k2] if use_k2 else [])
+        E = np.stack([e.cpu().numpy().ravel() for e in cols])
+        w = min_var_weights(E)
+        m = mse(sum(w[i] * cols[i] for i in range(len(cols))))
+        s = score(m, C)
+        tag = "QMC+K2+closure" if use_k2 else "QMC+closure   "
+        wtxt = " ".join(f"{v:+.2f}" for v in w)
+        print(f"  {n_pts:5d} {tag}: mse {m:.3e}  C {C:.2e} ({C/B_FLOP:5.1%})  "
+              f"score {s:.3e}  w=[{wtxt}]")
+        if best is None or s < best[0]:
+            best = (s, n_pts, w, m, C, use_k2)
 
-s_best, n_best, w_best, m_best, C_best = best
-print(f"\nbest 3-way: QMC{n_best} + K2 + closure -> score {s_best:.3e} "
-      f"(v4 {s_v4:.3e})")
+s_best, n_best, w_best, m_best, C_best, k2_best = best
+w3 = [float(w_best[0]), float(w_best[2]) if k2_best else 0.0, float(w_best[1])]
+print(f"\nbest: QMC{n_best}{' + K2' if k2_best else ''} + closure -> "
+      f"score {s_best:.3e}  (v4 {s_v4:.3e})")
 
 if s_best < s_v4 * 0.995:
     print(f"=> WINS by {s_v4/s_best:.3f}x — shipping.")
     np.savez(KIT / "closure.npz",
              theta=theta.cpu().numpy().astype(np.float32),
              meta=np.array([float(rank), float(n_best),
-                            float(w_best[0]), float(w_best[1]), float(w_best[2]),
-                            float(rank4)], dtype=np.float32),
+                            w3[0], w3[1], w3[2], float(rank4)], dtype=np.float32),
              **{"__meta__": np.frombuffer(b"{}", dtype=np.uint8)})
-    print(f"wrote {KIT/'closure.npz'} (rank {rank}, pts {n_best}, "
-          f"w {w_best.round(3).tolist()})")
+    print(f"wrote {KIT/'closure.npz'} (r3 {rank}, r4 {rank4}, pts {n_best}, "
+          f"w[qmc,k2,closure] = {[round(v,3) for v in w3]})")
     print("next:  cd ../whest-starterkit && uv run whest run --estimator . "
           "--split mini --runner subprocess")
 else:
