@@ -78,13 +78,43 @@ def core_slices(T, V):
     return slice_ij, diag
 
 
+def star_terms(h2s, Wr, Bs):
+    """Exact slice/diagonal of the star tensor  sum_i h2_i sym(w_i (x) B_i (x) B_i),
+    where w_i = Wr[i, :] and B_i = Bs[i, :].  O(n^3), no tensor materialized."""
+    C = h2s[:, None] * Wr * Bs
+    D = h2s[:, None] * Bs * Bs
+    slice_ij = 2.0 * (C.T @ Bs) + (D.T @ Wr)
+    diag = 3.0 * (h2s[:, None] * Wr * Bs * Bs).sum(0)
+    return slice_ij, diag
+
+
+def star_project(h2s, Wr, Bs, Z):
+    """Compress the star tensor onto a new basis: Z (n, r) is the composed map
+    P(u) = V'^T W'^T (h1 * u), i.e. Z = h1[:, None] * (W' @ V')."""
+    A = Wr @ Z                                    # (n, r)
+    Bv = Bs @ Z                                   # (n, r)
+    hA = h2s[:, None] * A
+    hB = h2s[:, None] * Bv
+    return (torch.einsum("im,ik,il->mkl", hA, Bv, Bv)
+            + torch.einsum("im,ik,il->mkl", hB, A, Bv)
+            + torch.einsum("im,ik,il->mkl", hB, Bv, A))
+
+
 def propagate(Ws, use_k3=True, use_star=True, truth=None):
-    """Ws: (L, n, n) float64. Returns final-layer mean and a per-layer kappa3 log."""
+    """Ws: (L, n, n) float64. Returns the final-layer mean and a per-layer kappa3 log.
+
+    kappa3(z_l) = [star born at layer l-1, kept at FULL fidelity, O(n^3)]
+                + [everything older, carried as a rank-r Tucker core]
+    The star is compressed only when it is carried PAST the layer it lands in --
+    where the rank test says the surviving structure really is low-rank.
+    Compressing it at birth threw away ~80% of its energy (that was the bug).
+    """
     # layer 0 pre-activation: x ~ N(0, I) exactly => m = 0, S = W0^T W0, kappa3 = 0
     m = torch.zeros(N_W, dtype=torch.float64)
     S = Ws[0].T @ Ws[0]
     T = torch.zeros(R, R, R, dtype=torch.float64)
     V = torch.linalg.eigh(S)[1][:, -R:]
+    star = None                                   # (h2, Wr, Bs) of the star in z_l space
     log = []
 
     for li in range(DEPTH):
@@ -99,6 +129,10 @@ def propagate(Ws, use_k3=True, use_star=True, truth=None):
 
         if use_k3:
             k3_slice, k3_diag = core_slices(T, V)
+            if star is not None:
+                ss, sd = star_terms(*star)
+                k3_slice = k3_slice + ss
+                k3_diag = k3_diag + sd
         else:
             k3_slice = torch.zeros_like(S)
             k3_diag = torch.zeros(N_W, dtype=torch.float64)
@@ -110,7 +144,7 @@ def propagate(Ws, use_k3=True, use_star=True, truth=None):
             log.append((li, c, float((k3_slice**2).mean().sqrt()),
                         float((tk**2).mean().sqrt())))
 
-        # ---- corrected post-activation moments (mean AND covariance together)
+        # ---- corrected post-activation moments (mean AND covariance TOGETHER)
         mu_a = s * pdf + m * cdf + (1.0 / 6.0) * h3 * k3_diag
         ez2 = (m * m + var) * cdf + m * s * pdf + (1.0 / 3.0) * h2 * k3_diag
         var_a = torch.clamp(ez2 - mu_a * mu_a, min=1e-14)
@@ -129,20 +163,14 @@ def propagate(Ws, use_k3=True, use_star=True, truth=None):
         V_next = torch.linalg.eigh(S_next)[1][:, -R:]
 
         if use_k3:
-            hW = h1[:, None] * W                       # diag(h1) W
-            # pass-through: T x M x M x M
-            M = V_next.T @ (W.T @ (h1[:, None] * V))   # (r, r)
+            Z = h1[:, None] * (W @ V_next)             # composed map P(u) = Z^T u
+            M = Z.T @ V                                # (r, r) pass-through of the core
             T_next = torch.einsum("mkl,am,bk,cl->abc", T, M, M, M)
-            if use_star:
-                B = S @ hW                             # (n, n): B_iq
-                A = W @ V_next                         # (n, r): (V'^T w_i)_m
-                Bv = B @ V_next                        # (n, r): (V'^T B_i)_m
-                hA = h2[:, None] * A
-                t1 = torch.einsum("im,ik,il->mkl", hA, Bv, Bv)
-                t2 = torch.einsum("im,ik,il->mkl", h2[:, None] * Bv, A, Bv)
-                t3 = torch.einsum("im,ik,il->mkl", h2[:, None] * Bv, Bv, A)
-                T_next = T_next + t1 + t2 + t3
+            if star is not None:                        # the old star gets compressed now
+                T_next = T_next + star_project(*star, Z)
             T = T_next
+            # the NEW star, born from this layer's ReLU, lives in z_{l+1} space
+            star = (h2, W, S @ (h1[:, None] * W)) if use_star else None
 
         m, S, V = m_next, S_next, V_next
 
