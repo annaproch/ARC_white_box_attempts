@@ -121,13 +121,27 @@ def k2_v4(Ws):
     return mu
 
 
-# ---- FLOP model (validated: predicts v4's grader utilisation to ~1%) --------
+# ---- FLOP model ------------------------------------------------------------
+# MEASURED on the grader, not estimated. My analytic estimate said the closure
+# cost 4.16e9 (1.5% of budget); the real cost is 1.13e10 (4.2%) -- I counted the
+# Tucker cores and forgot the matmuls that dominate: the star SLICE alone is four
+# 2n^3 matmuls (C3^T Bs, D3^T Wr, and two more for kappa4), on top of the
+# covariance propagation (4n^3) and the star's B matrix (2n^3): ~14 n^3 per layer,
+# not 6. Utilisation came in at 12.8% instead of 9.6% and the submission LOST.
+# Never trust an analytic FLOP estimate here again -- measure it.
 B_FLOP = 2.72e11
-PT_FLOP = DEPTH * (2 * N_W * N_W + 2 * N_W)          # per QMC point
+PT_FLOP = DEPTH * (2 * N_W * N_W + 2 * N_W)          # per QMC point (validated)
 K2_FLOP = 2.2e9                                      # v4's calibrated-K2 closure
-CL_FLOP = DEPTH * (6.0 * N_W ** 3 + 4.0 * N_W ** 2 * rank
-                   + 2.0 * N_W * rank ** 3 + 2.0 * rank ** 4        # kappa3 core
-                   + 2.0 * N_W * rank4 ** 4 + 2.0 * rank4 ** 5)     # kappa4 core
+RESID_FLOP = 1.7e9                                   # measured lambda * wall-time
+_CL_MEASURED = {(32, 8): 1.13e10}                    # (rank3, rank4) -> FLOPs
+CL_FLOP = _CL_MEASURED.get((rank, rank4))
+if CL_FLOP is None:                                  # crude scaling from the measured point
+    CL_FLOP = 1.13e10 * (14.0 * N_W ** 3 + 2.0 * N_W * rank ** 3
+                         + 2.0 * N_W * rank4 ** 4) / (
+        14.0 * N_W ** 3 + 2.0 * N_W * 32 ** 3 + 2.0 * N_W * 8 ** 4)
+    print(f"WARNING: closure cost for r3={rank},r4={rank4} is EXTRAPOLATED "
+          f"({CL_FLOP:.2e}). Measure it with `whest run` before trusting a win.")
+CL_FLOP += RESID_FLOP
 V4_PTS = 6400
 V4_C = V4_PTS * PT_FLOP + K2_FLOP                    # ~2.9e10 = 10.9% (matches grader)
 
