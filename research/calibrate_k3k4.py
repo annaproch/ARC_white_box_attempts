@@ -285,16 +285,24 @@ def closure(Ws, theta):
                                          T4, M4, M4, M4, M4)
 
         if star is not None:                                       # compress the old star
+            # The star tensor is sum_i h_i sym(A_i (x) B_i (x) B_i ...): the A-factor
+            # must sit in EACH slot once. Written as explicit einsums -- doing it
+            # with permutes put A in slot 1 twice and never in slot 2, so the core
+            # was not symmetric (flopscope's symmetry check caught this) and every
+            # kappa3/kappa4 slice was wrong.
             h2s, h3s, Wr, Bs = star
             A = torch.bmm(Wr, Z)
             Bv = torch.bmm(Bs, Z)
-            U3 = torch.einsum("bi,bim,bik,bil->bmkl", h2s, A, Bv, Bv)
-            T3 = T3 + c["c3g"][li] * (U3 + U3.permute(0, 2, 1, 3) + U3.permute(0, 2, 3, 1))
+            T3 = T3 + c["c3g"][li] * (
+                torch.einsum("bi,bim,bik,bil->bmkl", h2s, A, Bv, Bv)
+                + torch.einsum("bi,bim,bik,bil->bmkl", h2s, Bv, A, Bv)
+                + torch.einsum("bi,bim,bik,bil->bmkl", h2s, Bv, Bv, A))
             A4, Bv4 = A[:, :, :R4], Bv[:, :, :R4]
-            U4 = torch.einsum("bi,bim,bik,bil,bip->bmklp", h3s, A4, Bv4, Bv4, Bv4)
-            T4 = T4 + c["c4g"][li] * (U4 + U4.permute(0, 2, 1, 3, 4)
-                                      + U4.permute(0, 2, 3, 1, 4)
-                                      + U4.permute(0, 2, 3, 4, 1))
+            T4 = T4 + c["c4g"][li] * (
+                torch.einsum("bi,bim,bik,bil,bip->bmklp", h3s, A4, Bv4, Bv4, Bv4)
+                + torch.einsum("bi,bim,bik,bil,bip->bmklp", h3s, Bv4, A4, Bv4, Bv4)
+                + torch.einsum("bi,bim,bik,bil,bip->bmklp", h3s, Bv4, Bv4, A4, Bv4)
+                + torch.einsum("bi,bim,bik,bil,bip->bmklp", h3s, Bv4, Bv4, Bv4, A4))
 
         # the new star is born from THIS layer's pre-activation stats (S, h1, h2, h3)
         star = (h2, h3, W, torch.bmm(S_pre, h1.unsqueeze(2) * W))

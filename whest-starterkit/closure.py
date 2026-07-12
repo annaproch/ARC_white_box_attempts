@@ -179,17 +179,23 @@ def predict_final_mean(mlp, theta, rank, rank4, q0):
         T4 = c["c4p"] * fnp.einsum("mklp,am,nk,ol,qp->anoq", T4, M4, M4, M4, M4)
 
         if star is not None:                        # compress the old star forward
+            # sum_i h_i sym(A_i (x) B_i (x) B_i ...): the A-factor must appear in
+            # EACH slot exactly once. Explicit einsums -- the permute version put A
+            # in slot 1 twice and never in slot 2, leaving the core asymmetric
+            # (flopscope's symmetry check rejected it) and every slice wrong.
             h2s, h3s, Wr, Bs = star
             A = fnp.matmul(Wr, Z)
             Bv = fnp.matmul(Bs, Z)
-            U3 = fnp.einsum("i,im,ik,il->mkl", h2s, A, Bv, Bv)
-            T3 = T3 + c["c3g"] * (U3 + fnp.transpose(U3, (1, 0, 2))
-                                  + fnp.transpose(U3, (1, 2, 0)))
+            T3 = T3 + c["c3g"] * (
+                fnp.einsum("i,im,ik,il->mkl", h2s, A, Bv, Bv)
+                + fnp.einsum("i,im,ik,il->mkl", h2s, Bv, A, Bv)
+                + fnp.einsum("i,im,ik,il->mkl", h2s, Bv, Bv, A))
             A4, Bv4 = A[:, :r4], Bv[:, :r4]
-            U4 = fnp.einsum("i,im,ik,il,ip->mklp", h3s, A4, Bv4, Bv4, Bv4)
-            T4 = T4 + c["c4g"] * (U4 + fnp.transpose(U4, (1, 0, 2, 3))
-                                  + fnp.transpose(U4, (1, 2, 0, 3))
-                                  + fnp.transpose(U4, (1, 2, 3, 0)))
+            T4 = T4 + c["c4g"] * (
+                fnp.einsum("i,im,ik,il,ip->mklp", h3s, A4, Bv4, Bv4, Bv4)
+                + fnp.einsum("i,im,ik,il,ip->mklp", h3s, Bv4, A4, Bv4, Bv4)
+                + fnp.einsum("i,im,ik,il,ip->mklp", h3s, Bv4, Bv4, A4, Bv4)
+                + fnp.einsum("i,im,ik,il,ip->mklp", h3s, Bv4, Bv4, Bv4, A4))
 
         star = (h2, h3, W, fnp.matmul(S_pre, h1[:, None] * W))
         V = V_next
