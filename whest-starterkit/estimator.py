@@ -202,15 +202,28 @@ class Estimator(BaseEstimator):
             rows.append(fnp.mean(x, axis=0))
 
         if shape_ok:
-            k2 = self._calibrated_k2_final(mlp)
-            k2_np = fnp.asarray(k2, dtype=fnp.float64)
-            k2_ok = (bool(fnp.all(fnp.isfinite(k2_np)))
-                     and float(fnp.max(fnp.abs(k2_np))) < 10.0)
-            if analytic is not None and k2_ok and self._w is not None:
-                wq, wk2, wc = self._w
-                rows[-1] = wq * rows[-1] + wk2 * k2 + wc * analytic
+            # Only run K2 if it actually carries weight. The K3/K4 closure
+            # supersedes it (same covariance propagation, plus cumulants), and the
+            # held-out fit sets w_k2 = 0. Computing it anyway would burn 2.2e9
+            # FLOPs (0.8% of budget) on a value multiplied by zero -- enough to
+            # push us from 9.6% back over the 10% multiplier floor.
+            wq, wk2, wc = self._w if self._w is not None else (0.0, 0.0, 0.0)
+            need_k2 = analytic is None or self._w is None or abs(wk2) > 1e-6
+            k2, k2_ok = None, False
+            if need_k2:
+                k2 = self._calibrated_k2_final(mlp)
+                k2_np = fnp.asarray(k2, dtype=fnp.float64)
+                k2_ok = (bool(fnp.all(fnp.isfinite(k2_np)))
+                         and float(fnp.max(fnp.abs(k2_np))) < 10.0)
+
+            if analytic is not None and self._w is not None:
+                if abs(wk2) > 1e-6 and k2_ok:
+                    rows[-1] = wq * rows[-1] + wk2 * k2 + wc * analytic
+                else:  # renormalise over the components actually used
+                    tot = wq + wc
+                    rows[-1] = (wq / tot) * rows[-1] + (wc / tot) * analytic
             elif k2_ok:
-                # v4: QMC + calibrated-K2 at the offline-fitted weight.
+                # v4 fallback: QMC + calibrated-K2 at the offline-fitted weight.
                 rows[-1] = (1.0 - _W_K2) * rows[-1] + _W_K2 * k2
         return fnp.stack(rows, axis=0)
 
