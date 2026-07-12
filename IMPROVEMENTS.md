@@ -113,9 +113,59 @@ our error before building anything expensive.
    our earlier results: a per-layer scalar covariance correction (learned θ)
    bought 3×, while α-dependent marginal tweaks bought nothing.
 
-**Target is now precise:** kill the systematic off-diagonal bias — either with
-a low-rank κ₃ correction (rank suggested by eig1frac ≈ 1 dominant mode) or a
-richer learned correction to the *pairwise* update, and stop the compounding.
+## LAYERWISE DRIFT — MEASURED (`layerwise_cov_drift.py`, 3 MLPs)
+
+| layer | μ err | λ₁ err | mean-offdiag err | skew(c) | kurt(c) | eig1frac |
+|---|---|---|---|---|---|---|
+| L0 | 0.001 | −0.001 | −0.003 | 0.02 | 0.05 | 0.01 |
+| L2 | 0.003 | −0.07 | −0.63 | **0.31** | 0.13 | 0.03 |
+| L7 | 0.006 | −0.21 | −0.50 | **0.47** | 0.28 | 0.14 |
+| L15 | 0.008 | −0.27 | −0.40 | **0.45** | 0.28 | 0.34 |
+| L31 | 0.009 | **−0.27 … −0.39** | **−0.31 … −0.43** | **0.41–0.46** | 0.24–0.27 | **0.50–0.83** |
+
+*(The `var err` column in the raw output is a metric artifact — dead neurons
+have true variance ≈ 0, so the relative error explodes. Absolute diagonals are
+fine, as the near-perfect marginals confirm.)*
+
+**The mechanism, finally pinned down.** The failure is **one degree of
+freedom**: the dominant eigenmode of the activation covariance is strongly
+**non-Gaussian** (|skew| ≈ 0.3–0.5, kurt ≈ 0.1–0.3, established by layer 2 and
+persistent) while carrying 50–83% of the variance by the deep layers. The
+per-neuron *marginals* stay Gaussian (skew 0.02) — the non-Gaussianity is
+concentrated almost entirely in that single common mode. A Gaussian closure
+structurally cannot represent it, so it under-propagates the mode:
+λ₁ is underestimated by 27–43%, hence σ_z by ~30%, hence 98% of our error.
+
+**Consequence: we do NOT need full third-order tensors.** We need a *rank-1
+non-Gaussian core*.
+
+## THE BUILD: rank-1 non-Gaussian core closure (`core_closure.py`)
+
+Model the activations as
+`a = μ + √λ·u·c + ε`, with **c a scalar carrying its own skew/kurtosis**
+(tracked, represented by a Q-node Gauss–Hermite quadrature warped by a cubic
+Cornish–Fisher map) and **ε ~ N(0, R)**, R = Σ − λuuᵀ.
+
+Per layer, conditional on c the pre-activation is *exactly* Gaussian, so every
+ReLU expectation is a Q-node average of exact conditional formulas:
+- `μ' = Σ_q w_q M(c_q)` (M = exact 1-D ReLU mean)
+- `Σ' = Σ_q w_q [C(c_q) + M M ᵀ] − μ'μ'ᵀ` (law of total covariance; C from the
+  converged k≤4 Wick series around the *conditional* Gaussian)
+- re-extract the core (top eigenpair of Σ'), and push c forward:
+  `c'|c ~ N(t(c), v(c))` with `t(c) = u'ᵀ(M(c) − μ')`, `v(c) = u'ᵀC(c)u'` —
+  the new skew/kurt follow in closed form from the mixture moments.
+
+The non-Gaussianity is **generated automatically** by the nonlinearity of
+t(·), so we can start from a Gaussian c at layer 0 (true skew there: 0.02).
+
+Cost at n=256, L=32, Q=16, K=4: ~2n³ + Q·K·n² per layer ≈ **1.5e9 FLOPs
+(~0.6% of budget)** — pure analytic, comfortably at the floor, and a
+many-small-ops profile that matches the competitor's 1.1 GFLOP/s signature.
+This is ARC's deduction–projection / L²-sketching idea with the sketch chosen
+by the data (the top eigenvector).
+
+If it lands: layer the existing end-to-end calibration on top, drop sampling
+entirely, and port to flopscope.
 
 ## The plan
 
