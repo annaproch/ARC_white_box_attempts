@@ -1,6 +1,94 @@
 # ARC WhiteBox Estimation Challenge 2026 — Estimator Improvements & Session Log
 
-*2026-07-11 — research session with Claude Code*
+*2026-07-11/12 — research session with Claude Code*
+
+---
+
+# ⚠️ ROUND 7 — COMPETITOR ANALYSIS AND THE PIVOT (read this first)
+
+Our v4 (QMC + calibrated K=2 fusion) scores **3.396e-7** public, 1.9× the MC
+baseline. A top-10 competitor's per-MLP detail (submission tooltip,
+`bruce-mckenzie · idx 6`) forces a strategy change.
+
+## The evidence
+
+| field | their value | ours (v4) |
+|---|---|---|
+| L0–L30 per-layer MSE | **0.5–0.7 (garbage; zeros baseline is 0.91)** | ~7e-6 (accurate) |
+| L31 (only scored layer) | **3.24e-7** | ~3.1e-6 |
+| FLOPs | 2.30e10 (**8.5% — at the floor**) | 2.96e10 (10.9%) |
+| wall time | **20,947 ms** | ~300 ms |
+| per-MLP score | **3.24e-8** | ~3.4e-7 |
+
+## What it means
+
+1. **They do not sample at all.** Sampling produces every intermediate layer
+   mean for free; their intermediate rows are junk, so no forward pass over
+   inputs is happening. Pure analytic propagation, final layer only.
+2. **Wall-time signature = cumulant machinery.** 2.3e10 FLOPs in 21 s =
+   **1.1 GFLOP/s**, ~100× below matmul throughput ⇒ thousands of small
+   elementwise/transcendental ops. Exactly what the ARC paper reports for its
+   own kprop code (App. I). This is not a fast-matmul (sampling/QMC) profile.
+3. **21 s of wall time is allowed.** Only *residual* (non-flopscope) wall time
+   is penalized at λ; time inside flopscope kernels is free. **We have been
+   far too conservative about elementwise math.**
+4. **They are ~10× better than us at the same (floor) compute**, and in
+   variance-normalized terms (Var ≈ 0.012) their 3.24e-7 ≈ 2.7e-5 — which on
+   the paper's depth law c_K(L/n)^K at L=32, n=256 is **K=3-class accuracy**.
+   Our calibrated K=2 (2.4e-5 absolute ≈ 2e-3 normalized) is K=2-class.
+   **They are propagating third-order information; we are not.**
+
+## Our gaps (in order of cheapness to close)
+
+- **G1 — Hermite/Wick series truncated far too early.** The exact off-diagonal
+  ReLU covariance update is
+  `Cov(ReLU(Zi),ReLU(Zj)) = Σ_{k≥1} ĥ_k(i)·ĥ_k(j)·C_ij^k / k!`.
+  Our *shipped* flopscope estimator keeps **2 terms**; the torch experiments
+  kept 4. Deep ReLU covariance is dominated by a strong common-mode component
+  ⇒ pairwise |ρ| is **not** small ⇒ the series converges slowly and the
+  truncation error compounds over 32 layers. Each extra term is one
+  elementwise n×n multiply (~1e6 FLOPs/term/layer — negligible), and the
+  wall-time finding says we can afford dozens.
+- **G2 — no exact bivariate ReLU moment.** Closed forms exist: Cho–Saul
+  arc-cosine kernel (zero mean); with means via Owen's T / bivariate normal
+  CDF (Bibi et al. 2018; Wright et al. 2024 Thm 1 — both cited by the ARC
+  paper). O(n²) elementwise per layer; removes truncation error entirely.
+- **G3 — K=3 dismissed on a false premise (retraction).** We rejected K=3
+  because the paper's *factorized* cost is 30n³L² — but that L² comes from the
+  factor **rank growing with depth**. We asserted rank-compression "degrades,
+  not improves" — that was an assumption, **never measured**. Fixed-rank-r
+  compression each layer gives ~O(n²·r·L), which fits inside the floor. The
+  leaderboard shows someone getting K=3 accuracy at 2.3e10 FLOPs; fixed-rank
+  is the obvious mechanism.
+- **G4 — budget misallocated.** Our analytic component uses **0.83%** of
+  budget; samples eat the other ~10%. If the analytic side reaches
+  b² ≈ 3e-7, sampling adds nothing (fused ≈ b² when b² ≪ v). The endgame is
+  **pure analytic at the floor**, ~2.5e10 FLOPs of cumulant machinery.
+- **G5 — wasted effort on unscored layers.** Only L31 is ranked. Intermediate
+  accuracy is worth zero.
+
+## The plan
+
+1. **[hours] Fix G1.** Crank the Wick series 2 → 20–40 terms in the calibrated
+   K=2 and re-measure held-out MSE. Decisive, tiny change to existing code:
+   if MSE drops sharply, truncation was our 10×.
+2. **[hours] Fix G2.** Swap in the exact bivariate ReLU second moment
+   (arc-cosine / Owen's T) — removes the series entirely.
+3. **[days] Fix G3 — the real prize.** Fixed-rank factored third cumulant
+   (rank r tuned to fill the floor), with power cumulants and the odd-K trace
+   correction, i.e. the paper's K=3 made affordable by rank truncation.
+4. **Keep the end-to-end calibration harness** — it composes with *any*
+   closure (gave 3× on K=2) and is our differentiator. Re-fit after each of
+   1–3.
+5. **Re-derive the operating point (G4).** Once b² ≪ QMC variance, drop
+   sampling and spend the whole floor on the analytic method — matching the
+   competitor's profile (pure analytic, ~8.5–10% of budget, long wall time).
+
+**Most promising single idea:** exact (or high-order) ReLU covariance closure
++ fixed-rank third-cumulant propagation, calibrated end-to-end, run
+pure-analytic at the 10% floor.
+
+---
 
 ## Context
 
