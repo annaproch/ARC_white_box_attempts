@@ -45,17 +45,52 @@ print(f"checkpoint: step {ck['step']}, best val {ck['best_val']:.3e}, "
       f"rank3 {rank} / rank4 {rank4}")
 
 # ---- held-out MLPs (disjoint from training and from the val set that picked theta)
-seeds = list(range(950_000, 950_000 + 16))
+# CACHED: re-sampling the ground truth each run made the ship/no-ship decision
+# noisy (v4's mse moved 3.34e-6 -> 3.58e-6 between two identical exports).
+N_HELD, GT_N = 48, 4_000_000
+HELD = DATA / f"heldout_gt_{N_HELD}.pt"
+seeds = list(range(950_000, 950_000 + N_HELD))
 Ws = K.make_ws(seeds)
-gt = K.mc_final(Ws, 2_000_000)
-pts = torch.tensor(np.load(DATA / "points_v3.npy"), device=DEV)
+if HELD.exists():
+    gt = torch.load(HELD)["gt"].to(DEV)
+else:
+    print(f"building held-out GT: {N_HELD} MLPs x {GT_N:.0e} samples...")
+    gt = K.mc_final(Ws, GT_N)
+    torch.save({"seeds": seeds, "gt": gt.cpu(), "n_samples": GT_N}, HELD)
 
 
-def qmc_final(Ws):
-    x = pts.unsqueeze(0).expand(Ws.shape[0], -1, -1).contiguous()
+def make_points(n_pts):
+    """Sobol -> Gaussian -> whiten -> sphere, moment-matched AT THIS SIZE.
+
+    The shipped 6400-point set is whitened as a whole, so a PREFIX pts[:n] is
+    NOT moment-matched -- it has non-zero mean and non-identity covariance, which
+    throws away exactly the property that made QMC 3.2x better than iid. (Visible
+    in the sweep: 5600 points scored worse than 5200.) So build each candidate
+    set at its own size.
+    """
+    sob = torch.quasirandom.SobolEngine(N_W, scramble=True, seed=12345)
+    u = sob.draw(n_pts, dtype=torch.float64).clamp(1e-9, 1 - 1e-9)
+    x = math.sqrt(2.0) * torch.erfinv(2 * u - 1)
+    x = x - x.mean(dim=0)
+    L = torch.linalg.cholesky((x.T @ x) / n_pts)
+    x = torch.linalg.solve_triangular(L, x.T, upper=False).T      # cov = I exactly
+    e_r = math.sqrt(2.0) * math.exp(math.lgamma((N_W + 1) / 2) - math.lgamma(N_W / 2))
+    x = x / x.norm(dim=1, keepdim=True) * e_r                     # exact radial integral
+    return x.float().to(DEV)
+
+
+def qmc_from(points, Ws):
+    x = points.unsqueeze(0).expand(Ws.shape[0], -1, -1).contiguous()
     for li in range(DEPTH):
         x = torch.relu(torch.bmm(x, Ws[:, li]))
     return x.mean(1)
+
+
+pts_full = make_points(6400)
+
+
+def qmc_final(Ws):
+    return qmc_from(pts_full, Ws)
 
 
 def k2_v4(Ws):
@@ -133,10 +168,7 @@ print("\nsweep (score = mse x max(0.1, C/B); compute must come back near the flo
 best = None
 qmc_cache = {}
 for n_pts in (6400, 6000, 5600, 5200, 4800, 4400, 4000, 3600):
-    x = pts[:n_pts].unsqueeze(0).expand(len(seeds), -1, -1).contiguous()
-    for li in range(DEPTH):
-        x = torch.relu(torch.bmm(x, Ws[:, li]))
-    e_qn = x.mean(1) - gt
+    e_qn = qmc_from(make_points(n_pts), Ws) - gt      # matched AT this size
     qmc_cache[n_pts] = e_qn
     for use_k2 in (False, True):
         C = n_pts * PT_FLOP + CL_FLOP + (K2_FLOP if use_k2 else 0.0)
@@ -159,6 +191,12 @@ print(f"\nbest: QMC{n_best}{' + K2' if k2_best else ''} + closure -> "
 
 if s_best < s_v4 * 0.995:
     print(f"=> WINS by {s_v4/s_best:.3f}x — shipping.")
+    # ship the point set BUILT AT n_best (a prefix of the 6400 set is not
+    # moment-matched, which is what made the sweep non-monotonic)
+    best_pts = make_points(n_best).cpu().numpy().astype(np.float32)
+    np.savez(KIT / "points.npz", x=best_pts,
+             **{"__meta__": np.frombuffer(b"{}", dtype=np.uint8)})
+    print(f"wrote {KIT/'points.npz'} ({n_best} points, moment-matched at that size)")
     np.savez(KIT / "closure.npz",
              theta=theta.cpu().numpy().astype(np.float32),
              meta=np.array([float(rank), float(n_best),
