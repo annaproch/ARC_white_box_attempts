@@ -42,19 +42,23 @@ ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "data" / "moment_corpus"
 DATA = ROOT / "data"
 R, R4 = 32, 8
-STEPS, LR = 400, 3e-2
+STEPS, LR = 120, 5e-2
+N_MLPS = 8      # the loss loops over MLPs sequentially; 32 made a step ~30s
 
 _Q0 = torch.randn(N_W, R, generator=torch.Generator().manual_seed(7)).to(DEV)
 
 
 def top_basis(S):
+    """Same procedure as the trainer/estimator. MPS has no QR/eigh kernel, so do
+    those two small ops on the CPU (bases are computed once, under no_grad)."""
     Q = _Q0
     for _ in range(2):
-        Q, _ = torch.linalg.qr(S @ Q)
-    Sr = Q.T @ S @ Q
+        Y = (S @ Q).cpu()
+        Q = torch.linalg.qr(Y).Q.to(S.device)
+    Sr = (Q.T @ S @ Q).cpu()
     Sr = 0.5 * (Sr + Sr.T)
     _, U = torch.linalg.eigh(Sr)
-    return Q @ torch.flip(U, dims=[1])
+    return (Q.cpu() @ torch.flip(U, dims=[1])).to(S.device)
 
 
 def sym4(T):
@@ -144,11 +148,11 @@ def propagate(rec, Vs, coef, use_chain=True):
     return out
 
 
-recs = load(32)
-print(f"{len(recs)} MLPs; precomputing bases...")
+recs = load(N_MLPS)
+print(f"{len(recs)} MLPs; precomputing bases...", flush=True)
 t0 = time.time()
 VS = [bases(r) for r in recs]
-print(f"  done ({time.time()-t0:.0f}s)")
+print(f"  done ({time.time()-t0:.0f}s)", flush=True)
 
 raw = torch.zeros(DEPTH, 5, device=DEV, requires_grad=True)   # c3g,c3p,c4g,c4p,c4chain
 opt = torch.optim.Adam([raw], lr=LR)
@@ -176,9 +180,9 @@ def losses(coef, use_chain, grad=True):
 with torch.no_grad():
     b3, b4 = losses(coefs(torch.zeros(DEPTH, 5, device=DEV)), use_chain=False)
     c3, c4 = losses(coefs(torch.zeros(DEPTH, 5, device=DEV)), use_chain=True)
-print(f"\nrelative error of the PROPAGATED cumulants (1.0 = as bad as predicting 0):")
-print(f"  star only     : kappa3 {float(b3):.3f}   kappa4 {float(b4):.3f}")
-print(f"  star + chain  : kappa3 {float(c3):.3f}   kappa4 {float(c4):.3f}  <- chain effect")
+print(f"\nrelative error of the PROPAGATED cumulants (1.0 = as bad as predicting 0):", flush=True)
+print(f"  star only     : kappa3 {float(b3):.3f}   kappa4 {float(b4):.3f}", flush=True)
+print(f"  star + chain  : kappa3 {float(c3):.3f}   kappa4 {float(c4):.3f}  <- chain effect", flush=True)
 
 print("\nfitting generation / pass-through / chain coefficients...")
 t0 = time.time()
@@ -190,9 +194,9 @@ for step in range(1, STEPS + 1):
     loss.backward()
     torch.nn.utils.clip_grad_norm_([raw], 1.0)
     opt.step()
-    if step % 25 == 0:
+    if step % 10 == 0:
         print(f"  step {step:4d}  kappa3 {float(l3):.4f}  kappa4 {float(l4):.4f}  "
-              f"({time.time()-t0:.0f}s)")
+              f"({time.time()-t0:.0f}s)", flush=True)
 
 torch.save({"raw": raw.detach().cpu(), "rank": R, "rank4": R4}, DATA / "fit_cumulants.pt")
 print(f"\nsaved {DATA/'fit_cumulants.pt'}")
