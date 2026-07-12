@@ -65,6 +65,22 @@ def _top_basis(S, Q0, iters=2):
     return fnp.matmul(Q, U)
 
 
+def _mode_contract(T, M, ndim, r):
+    """Apply M to every mode of the (r,)*ndim tensor T:  T' = T x M x ... x M.
+
+    Matmul + reshape/transpose only (both free of symmetry inference; reshapes and
+    transposes are 0-FLOP in flopscope). einsum would tag the result symmetric from
+    the repeated M operands and then reject it.
+    """
+    for axis in range(ndim):
+        T = fnp.moveaxis(T, axis, 0)                    # bring this mode to front
+        T = fnp.reshape(T, (r, -1))
+        T = fnp.matmul(M, T)                            # contract it
+        T = fnp.reshape(T, (r,) * ndim)
+        T = fnp.moveaxis(T, 0, axis)                    # put it back
+    return T
+
+
 def _wick_cov(a, pdf, cdf, s, rho):
     g = [cdf, pdf]
     he_prev, he_cur = fnp.ones_like(a), a
@@ -175,27 +191,48 @@ def predict_final_mean(mlp, theta, rank, rank4, q0):
         Z = h1[:, None] * fnp.matmul(W, V_next)
         M = fnp.matmul(Z.T, V)
         M4 = M[:r4, :r4]
-        T3 = c["c3p"] * fnp.einsum("mkl,am,nk,ol->ano", T3, M, M, M)
-        T4 = c["c4p"] * fnp.einsum("mklp,am,nk,ol,qp->anoq", T4, M4, M4, M4, M4)
+        # pass-through T x M x M x ... x M, by mode contractions (matmul only:
+        # einsum would infer a symmetry tag from the repeated M operands)
+        T3 = c["c3p"] * _mode_contract(T3, M, 3, r)
+        T4 = c["c4p"] * _mode_contract(T4, M4, 4, r4)
 
         if star is not None:                        # compress the old star forward
-            # sum_i h_i sym(A_i (x) B_i (x) B_i ...): the A-factor must appear in
-            # EACH slot exactly once. Explicit einsums -- the permute version put A
-            # in slot 1 twice and never in slot 2, leaving the core asymmetric
-            # (flopscope's symmetry check rejected it) and every slice wrong.
+            # sum_i h_i sym(A_i (x) B_i (x) B_i): the A-factor sits in each slot once.
+            #
+            # Built with MATMULS, not einsum: flopscope infers a symmetry tag from
+            # einsum's repeated (Bv, Bv) operands and demands the result be symmetric
+            # across ALL axes -- but an individual term is only symmetric in (k, l);
+            # just their SUM is fully symmetric. The inferred tag then fails
+            # validation ("max deviation = inf"), which killed every MLP on the
+            # grader. Matmul carries no such inference. Same FLOPs, same math.
             h2s, h3s, Wr, Bs = star
-            A = fnp.matmul(Wr, Z)
-            Bv = fnp.matmul(Bs, Z)
-            T3 = T3 + c["c3g"] * (
-                fnp.einsum("i,im,ik,il->mkl", h2s, A, Bv, Bv)
-                + fnp.einsum("i,im,ik,il->mkl", h2s, Bv, A, Bv)
-                + fnp.einsum("i,im,ik,il->mkl", h2s, Bv, Bv, A))
-            A4, Bv4 = A[:, :r4], Bv[:, :r4]
-            T4 = T4 + c["c4g"] * (
-                fnp.einsum("i,im,ik,il,ip->mklp", h3s, A4, Bv4, Bv4, Bv4)
-                + fnp.einsum("i,im,ik,il,ip->mklp", h3s, Bv4, A4, Bv4, Bv4)
-                + fnp.einsum("i,im,ik,il,ip->mklp", h3s, Bv4, Bv4, A4, Bv4)
-                + fnp.einsum("i,im,ik,il,ip->mklp", h3s, Bv4, Bv4, Bv4, A4))
+            A = fnp.matmul(Wr, Z)                              # (n, r)
+            Bv = fnp.matmul(Bs, Z)                             # (n, r)
+            X = h2s[:, None] * A                               # weight goes on A
+            Y = Bv
+
+            def _tri(L, M1, M2, rr):
+                """sum_i L[i,m] M1[i,k] M2[i,l]  ->  (rr, rr, rr), via one matmul."""
+                KL = fnp.reshape(M1[:, :, None] * M2[:, None, :], (n, rr * rr))
+                return fnp.reshape(fnp.matmul(L.T, KL), (rr, rr, rr))
+
+            T3 = T3 + c["c3g"] * (_tri(X, Y, Y, r)             # A in slot 0
+                                  + _tri(Y, X, Y, r)           # A in slot 1
+                                  + _tri(Y, Y, X, r))          # A in slot 2
+
+            X4 = (h3s[:, None] * A)[:, :r4]
+            Y4 = Bv[:, :r4]
+
+            def _quad(L, M1, M2, M3):
+                KLP = fnp.reshape(
+                    M1[:, :, None, None] * M2[:, None, :, None] * M3[:, None, None, :],
+                    (n, r4 * r4 * r4))
+                return fnp.reshape(fnp.matmul(L.T, KLP), (r4, r4, r4, r4))
+
+            T4 = T4 + c["c4g"] * (_quad(X4, Y4, Y4, Y4)
+                                  + _quad(Y4, X4, Y4, Y4)
+                                  + _quad(Y4, Y4, X4, Y4)
+                                  + _quad(Y4, Y4, Y4, X4))
 
         star = (h2, h3, W, fnp.matmul(S_pre, h1[:, None] * W))
         V = V_next
