@@ -41,27 +41,28 @@ def _coeffs(theta_row):
     }
 
 
-def _orth(Y):
-    """Orthonormalise the columns of Y (n, r) by modified Gram-Schmidt.
-    flopscope has no QR; MGS is O(n r^2) and uses only matmul/elementwise ops."""
-    cols = []
-    r = Y.shape[1]
-    for j in range(r):
-        v = Y[:, j]
-        for u in cols:
-            v = v - u * fnp.sum(u * v)
-        nrm = fnp.sqrt(fnp.maximum(fnp.sum(v * v), 1e-30))
-        cols.append(v / nrm)
-    return fnp.stack(cols, axis=1)
+def _top_basis(S, Q0, iters=2):
+    """Top-r subspace of S by randomized subspace iteration, with a Rayleigh-Ritz
+    step so the columns come out ORDERED by eigenvalue.
 
-
-def _top_basis(S, r, iters=2):
-    """Top-r subspace of S by randomized subspace iteration (matmul + MGS)."""
-    rng = fnp.random.default_rng(7)
-    Q = fnp.array(rng.standard_normal((S.shape[0], r)).astype(fnp.float32))
+    Mirrors research/calibrate_k3k4.py exactly. Two things matter:
+      * ordering: kappa4 uses the LEADING r4 columns, which is only the dominant
+        sub-subspace if the columns are sorted;
+      * the start block Q0 is SHIPPED, so the estimator and the trainer build the
+        same basis and the calibrated coefficients are applied to what they were
+        fitted on.
+    QR + a small (r x r) eigh are flopscope primitives (and far cheaper than a
+    Python Gram-Schmidt loop, which would have cost thousands of tiny ops per MLP
+    in residual wall time).
+    """
+    Q = Q0
     for _ in range(iters):
-        Q = _orth(fnp.matmul(S, Q))
-    return Q
+        Q, _ = fnp.linalg.qr(fnp.matmul(S, Q))
+    Sr = fnp.matmul(Q.T, fnp.matmul(S, Q))
+    Sr = 0.5 * (Sr + Sr.T)
+    _, U = fnp.linalg.eigh(Sr)          # ascending eigenvalues
+    U = U[:, ::-1]                      # -> descending
+    return fnp.matmul(Q, U)
 
 
 def _wick_cov(a, pdf, cdf, s, rho):
