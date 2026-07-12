@@ -608,6 +608,42 @@ analytic bias² from 2.4e-5 → 1e-5 → 5e-6 moves the fused score −13% → �
 relative to v3. The K=3-augmented ceiling (1.8e-6) is the theoretical limit
 of what third-order information can contribute.
 
+**K=2.5 verdict (measured): 2.352e-5 vs calibrated-K=2's 2.408e-5 — only
+−2.3%.** The diagonal-κ₃/Edgeworth channel is nearly empty: the useful K=3
+information lives in the *joint* (off-diagonal) third cumulants, exactly as
+the earlier marginal-vs-joint analysis predicted. Tier 2 plateaus at
+~2.4e-5; closing the gap to the 1.8e-6 ceiling requires the rank-r factored
+sketch (tier 3) — a research-project lift, parked.
+
+## v4 public result and the improvement roadmap for this architecture
+
+**v4 public: 3.396e-7** (projected 3.4e-7 — model is well-calibrated),
+1.9× ahead of the MC reference; raw MSE 3.12e-6 (−15% vs v3); utilization
+10.89% (grader λ·R again ~0.3% above local). **The worst-MLP tail improved
+most** (1.18e-6 → 9.67e-7): fusion helps precisely where sampling variance
+is highest — which points at the next lever.
+
+Ranked improvements for the fused architecture:
+
+1. **Per-MLP adaptive fusion weight** (v4.1 candidate, validating now):
+   per-MLP QMC variance v_m spans ~25×, and is estimable from the existing
+   6400 samples to ~2% relative error at ~3e6 FLOPs (free). Set
+   w_m = v̂_m/(v̂_m + b²) with only b² global. High-variance (tail) MLPs get
+   w up to ~0.4 instead of 0.137 → projected −25% on tail MLPs, −5–8% mean.
+   Unlike the failed per-*neuron* fusion, the per-MLP steering signal is far
+   above its own noise — this resolves the earlier no-go's premise.
+2. **Lower b² compounds with #1** (all w_m rise). K=2.5 gave only −2.3%;
+   next real step is tier 3.
+3. **Train θ and w jointly against the fused objective** (θ currently
+   minimizes analytic MSE; optimizing through the fusion makes the closure
+   specialize in the component QMC lacks).
+4. **Refit w/b² on ~200 offline MLPs** (current fit used 24; ~20% noise).
+5. FLOPs (all minor, multiplier is linear): K2 costs 0.83% of budget
+   (symmetric einsums already); merging the ~640 small fnp calls in the K2
+   loop could shave ~0.2% of grader residual wall-time. Not worth it:
+   cutting points to duck the floor (β_local ≈ 1.7, measured losing trade),
+   fusing non-final layers (unscored).
+
 ### v3.1 post-mortem: the floor is not a cliff
 
 The "free fix" (trim to 9.95% utilization) was a sign error, and the public
