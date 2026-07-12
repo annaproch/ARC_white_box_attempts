@@ -263,6 +263,45 @@ the competitor's 3.2e-7.**
 
 ---
 
+# 🧪 THE PURE-ANALYTIC SUBMISSION (public split) — validated, and one surprise
+
+Submitted the sampling-free closure (κ₃+κ₄, r₃=32/r₄=8, w = [0,0,1]) to get a
+real public-split measurement of the analytic path.
+
+| | predicted offline | **actual (public, 50 MLPs)** |
+|---|---|---|
+| raw final-layer MSE | 1.05–1.19e-5 | **1.09e-5** ✓ |
+| adjusted score | ~1.2e-6 | **1.094e-6** ✓ (10% better) |
+| all-layers MSE | — | 1.01e-5 (we predict *every* layer well) |
+| utilisation | ~5% | **8.10%** ⚠️ |
+| vs MC reference (6.47e-7) | — | **0.6× — worse than plain sampling** |
+| vs v4 (3.396e-7) | — | 3.2× behind |
+
+**Two findings.**
+
+1. **The offline pipeline transfers.** corpus → closure → predicted score landed
+   within 10% on unseen MLPs. We can trust offline estimates of the analytic path.
+2. **⚠️ THE GRADER CHARGES ~6× MORE RESIDUAL WALL TIME THAN OUR MACHINE.**
+   Analytical FLOPs 1.14e10 (4.2%), but *effective compute* **2.20e10 (8.1%)** —
+   i.e. ~1.1e10 of residual wall time (λ = 1e11 FLOP/s × ~0.11 s/MLP). Locally we
+   measured 17 ms/MLP; the grader saw ~110 ms/MLP.
+
+   Harmless here (8.1% < the 10% floor, so the multiplier still pinned at 0.1),
+   but **it changes the fusion economics**: the closure's real cost is ~8% of
+   budget, not 4.2%. Any QMC+closure fusion is therefore even further from
+   viable than the export assumed — the closure would have to be *much* more
+   accurate to pay for ~8% of budget.
+
+   **Rule: the closure's cost must be measured on the GRADER, not with flopscope
+   locally.** Local FLOP counting misses the Python-side residual entirely.
+
+**Process note (my mistake):** the stale pure-analytic `closure.npz` from an
+earlier test was still on disk when the export declined to write a new one, so it
+shipped unnoticed. Delete artefacts on revert; do not rely on "the export won't
+overwrite it".
+
+---
+
 # 📜 THE COMPLETE HISTORY — every idea, what happened, why
 
 Chronological. Includes the mistakes, because most of the learning is in them.
@@ -340,11 +379,40 @@ Chronological. Includes the mistakes, because most of the learning is in them.
 | 37 | **Why κ₄ is broken** | It omits the **κ₃-mixed diagrams** (`ĥ₂ĥ₁ĥ₁ĥ₁·κ₃(z)·Σ`), which are the **same order** as the star we do compute. Not a coefficient error — a structurally missing family. |
 | 38 | κ₃ error vs rank | r=8: 24% · r=16: 14% · r=32: 7.7% · r=64: 5.7% · r=96: 4.7%. Rank-limited, diminishing. |
 
+## Phase 8 — Dropping κ₄, and the final verdict
+
+| # | experiment | result |
+|---|---|---|
+| 39 | `--no-k4`: genuinely remove κ₄ (the `exp(1.5·tanh)` parametrisation bottoms out at 0.22, so calibration could **never** switch it off — it was forced to carry a harmful term) | closure 1.05e-5 → **9.6e-6**; fused MSE 3.02e-6 → 2.85e-6. Removing a harmful term helps a little; it adds no accuracy. |
+| 40 | **Measure** closure FLOPs with flopscope instead of estimating | κ₃+κ₄ (r32/r4=8) **1.14e10**; κ₃-only (r32) **8.65e9**; κ₃-only (r64) **2.73e10** — rank 64 is off the table. |
+| 41 | Export sweep, κ₄ dropped, measured costs, 48 held-out MLPs | **No gain.** Best 3.745e-7 vs v4's 3.551e-7. The closure *improves accuracy 14%* (fused MSE 2.85e-6 vs v4's 3.31e-6, and it earns a fusion weight of 0.29–0.38 — the old K2 only got 0.10) but **loses on compute**. |
+| 42 | Pure-analytic public submission | **1.094e-6** — accuracy exactly as predicted, but the grader charged **8.1%** utilisation vs 4.95% locally (residual wall time — see the section above). |
+
 ## Where that leaves the numbers
 
-The closure's error decomposes cleanly: **corrections are exact; κ₃ is 6.7% wrong; κ₄ is worse than zero.** A 6.7%-wrong κ₃ leaves 6.7% of each layer's correction unapplied, compounding over 32 layers into ≈1e-5 — which is exactly the plateau we measured in every configuration.
+The closure's error decomposes cleanly: **corrections are exact; κ₃ is 6.7% wrong; κ₄ is worse than zero.** A 6.7%-wrong κ₃ leaves 6.7% of each layer's correction unapplied, compounding over 32 layers into ≈1e-5 — exactly the plateau measured in *every* configuration (r=16/32, r₄=1/8/32, with and without κ₄).
 
-**To beat v4 the closure needs MSE < ~4e-6 (≈3× better).** That 3× is precisely what a *working* κ₄ is worth (the unit test measured 145× on the mean step). Everything else — rank, coefficients, Wick terms — is already squeezed.
+**Both doors are shut, and we know why:**
+
+- **Cost.** ~10n³/layer of irreducible matmuls (covariance propagation 4n³, star `B` 2n³, star slice 4n³) plus cores — and on the **grader** it effectively costs ~8% of budget once residual wall time is charged. Even a maximally optimised version buys **parity** with v4, not a win.
+- **Accuracy.** The closure sits at 9.6e-6 and needs **< 4e-6** to earn its FLOPs.
+
+**That 2.5× gap is exactly what a working κ₄ is worth** (unit test: 145× on the mean step, after κ₃). Everything else — rank, coefficients, Wick terms, the chain diagram — is squeezed dry.
+
+## ➡️ THE NEXT SESSION HAS ONE JOB: FIX κ₄
+
+κ₄'s generation omits the **κ₃-mixed diagrams**:
+
+    ĥ₂(i)·ĥ₁(j)·ĥ₁(k)·ĥ₁(l) · κ₃(z_i,z_j,z_k) · Σ_il      (+ permutations)
+
+Order check: star ~ h₃·Σ³ ~ σ⁴; κ₃-mixed ~ h₂·κ₃·Σ ~ (1/σ)·σ³·σ² = **σ⁴ — the same order**. We compute one leading family and omit another. That is why our κ₄ is *worse than predicting zero* (rel. err 2.54, and **worse at higher rank**: 3.18 at r₄=32 — a clean signature of a wrong formula being propagated more faithfully), and why the chain diagram (a genuinely third-order term) barely moved it.
+
+Two routes:
+
+1. **Derive the κ₃-mixed diagrams.** Principled — but this session I mis-derived a symmetrisation, misread `permute` semantics, and under-estimated FLOPs by 2.7×. Hand-derivation carries real risk here.
+2. **Learn κ₄'s slice from the local state.** The corrections need only κ₄'s *diagonal* (κ₄_iiii) and *slice* (κ₄_iijj) — n²-sized objects — and the corpus has exact targets for both at every layer. Fit a map from (α_i, α_j, ρ_ij, κ₃ slice) → κ₄ slice. Cheaper at inference (n², not n·r⁴), and **it cannot fail silently**, because it is fit against sampled truth.
+
+Success criterion, unambiguous: **get the closure under 4e-6 and it ships.**
 
 ---
 

@@ -19,15 +19,24 @@ import flopscope.numpy as fnp
 from whestbench import MLP, BaseEstimator
 
 # The harness imports estimator.py by path and does NOT put its directory on
-# sys.path, so a bare `import closure` can fail on the grader. Load it by path
-# relative to this file, falling back to a plain import.
+# sys.path, so a bare `import closure` fails on the grader; load it by path.
+#
+# This MUST degrade gracefully: a submission packaged in file mode ships only
+# estimator.py, and a hard failure here aborts the whole run at import
+# (IMPORT_FAILED, nothing graded). The analytic closure is optional — without it
+# the estimator is exactly v4 — so never let its absence be fatal.
+closure = None
 try:
-    import closure
-except ModuleNotFoundError:  # pragma: no cover - grader path
-    _spec = importlib.util.spec_from_file_location(
-        "closure", Path(__file__).resolve().parent / "closure.py")
-    closure = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(closure)
+    import closure  # noqa: F811
+except Exception:  # pragma: no cover - grader path
+    try:
+        _p = Path(__file__).resolve().parent / "closure.py"
+        if _p.exists():
+            _spec = importlib.util.spec_from_file_location("closure", _p)
+            closure = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(closure)
+    except Exception:
+        closure = None
 
 
 def _closure_flops(n: int, depth: int, r: int, r4: int = 8) -> float:
