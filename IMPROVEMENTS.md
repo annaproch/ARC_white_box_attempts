@@ -261,6 +261,64 @@ inconsistent, which is worse than K=2's self-cancelling fixed point. Propagate
 consistently and the L31 row projects a final-layer error of **~5e-8 — below
 the competitor's 3.2e-7.**
 
+## 📊 HONEST SCORECARD (as of the κ₃ closure, before κ₄ + calibration)
+
+**Leaderboard reality:**
+
+| entry | public score | raw final-layer MSE | budget used | method |
+|---|---|---|---|---|
+| **our v4 (submitted, best)** | **3.396e-7** | 3.12e-6 | 10.9% | QMC (6400 shipped pts) + calibrated K=2, fused |
+| our v3 | 3.689e-7 | 3.67e-6 | 10.1% | QMC only |
+| our v1 | 6.53e-7 | 6.5e-6 | 9.2% | iid MC — tied the MC reference exactly |
+| MC reference | 6.47e-7 | — | — | organizers' baseline |
+| top-10 rival (bruce-mckenzie) | 3.24e-8 (per-MLP) | 3.24e-7 | 8.5% | **pure analytic**, 21 s wall, no sampling |
+| **leader** | **9.16e-8** | 3.55e-7 | 26% | unknown; analytic-dominant |
+
+**Where the analytic closure actually stands:**
+
+| closure | raw MSE | vs v4's raw (3.12e-6) |
+|---|---|---|
+| plain K=2 | 1.30e-4 | 42× worse |
+| K=2 + κ₃, rank 16 | 3.92e-5 | 13× worse |
+| K=2 + κ₃, **rank 48** | **2.76e-5** | **9× worse** |
+| K=2 + κ₃ + κ₄, rank 8, *uncalibrated* | 4.61e-5 | 15× worse |
+| *target to beat v4* | **< 3.1e-6** | — |
+
+**Read this honestly: the analytic closure does NOT beat v4 yet — it is ~9×
+short on raw MSE.** Being cheap (0.5–1% of budget vs 10%) buys nothing extra,
+because the score multiplier floors at 10%; a pure-analytic estimator must win
+on raw MSE alone.
+
+What we have that justifies continuing:
+- κ₃ propagation *works*: correlation with sampled truth 0.94–0.97 across depth,
+  magnitude ~65% of truth (rank 48), and it already gives **4.7×** over K=2.
+- The single-step unit test says **κ₄ is worth ~145× on the mean step after κ₃**
+  — that is the missing factor, and it is not yet in any end-to-end number.
+- Calibration bought 3× on plain K=2, and the closure now *contains* the right
+  structural terms for it to correct (our κ₃ has the right shape but ~35% low —
+  exactly what a learned per-layer scale fixes).
+- Fallback: even at analytic b² ≈ 1e-5, **fusing** with the existing QMC gives
+  ≈3e-6 → score ≈3e-7, i.e. roughly v4. So the work has a floor under it.
+
+Risk, stated plainly: κ₄ + calibration must deliver ~9× for the pure-analytic
+route to overtake v4, and ~30× more to reach the leader. Plausible from the
+unit test, unproven end-to-end.
+
+## RANK: a separate knob from κ₃/κ₄ (not a substitute)
+
+- **κ₃/κ₄ = which physics is included** → sets the accuracy *ceiling*. No amount
+  of rank reaches it (the unit test's 145× from κ₄ is unavailable to K=3).
+- **rank = fidelity of the carried cores** → representation error only. It has
+  built-in diminishing returns: the accumulated κ₃ is nearly rank-1 at depth
+  (top-1 energy 0.98), and the early layers where it is genuinely high-rank are
+  covered by the *uncompressed* star term.
+- Measured: r=16 → 3.32×, r=48 → 4.72× over K=2. Real, but saturating.
+- **Cost asymmetry matters:** κ₃'s core costs O(n·r³ + r⁴); κ₄'s costs
+  O(n·r⁴ + r⁵). At r=48 the κ₄ star projection alone would be ~4.3e10 FLOPs =
+  **16% of budget** — past the floor for nothing. So: **large rank for κ₃
+  (32–48), small for κ₄ (8–16)**, which is exactly what the rank-1-at-depth
+  evidence supports.
+
 ## THE BUILD: compute κ₃(z) analytically at O(n³) — no tensors
 
 κ₃ of the activations is **structured**, not arbitrary. Leading order (star
