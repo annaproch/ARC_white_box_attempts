@@ -675,6 +675,130 @@ Caveat to carry: the spec was measured with iid multiplicative noise. A rank-R
 truncation error is *structured*, so 2-5% is indicative, not exact — validate
 against the real propagation, not against this number.
 
+## 4.9 STEP BACK (2026-07-12 evening) — what went right, what I missed
+
+### 4.9.1 What went right (keep doing)
+
+1. **Measure the ceiling and the tolerance BEFORE building.** E2 (oracle) → E5
+   (complete-formula ceiling 5.59e-7) → E6 (spec: κ₃ ≤5%, κ₄ 10-20%). Every
+   architecture decision since has been made against a measured number instead
+   of an argument. This is the single most valuable habit adopted.
+2. **Falsifiable experiments kill bad ideas in minutes, not weeks.** The
+   conditional-Gaussian closure (a week of work) died in 10 minutes because the
+   test had a built-in refutation criterion. Same for the router and the
+   sampling hybrid.
+3. **Programmatic diagram enumeration** (`diagrams.py`) after three hand-derivation
+   bugs in one day. It reproduces every hand derivation and generates families we
+   would never have found by hand.
+4. **Cross-validating independent codepaths** (E2 vs E3′ vs E5 agree to ~3%).
+   In a project whose history is littered with numbers that don't replicate,
+   this is what makes a result citable.
+5. **Verifying at the REAL shape.** n=12/32 said star-only was 62.8% wrong;
+   n=256 says 9.5% at L1 and 69% at L3. Small-n is a different physics regime
+   (1/n expansion) — it would have sent us somewhere useless.
+
+### 4.9.2 What I missed (do not repeat)
+
+1. **⛔ I forgot the competition is ESTIMATION UNDER BUDGET, not exact
+   computation.** I built a complete-diagram closure that is physically correct
+   and **147% of budget** (n⁴ mode products) — unshippable by construction. I
+   validated the *physics* without checking whether *that implementation* could
+   ever run in-budget. Same class of error as the logged 2.7× FLOP miscount I
+   had criticised. **Rule: every closure design must be priced (flopscope)
+   BEFORE it is validated, not after.**
+2. **⛔ I under-weighted FUSION** (see §4.9.3). I treated the closure as a
+   standalone competitor that had to beat MC, when it is a *fusion component*
+   that only has to be independent and comparable. This changes the required
+   accuracy by ~5×, and therefore changes which architectures are viable.
+3. **I implemented cumulant formulas to "leading order" three times** (r=2
+   update, κ₃ generation, κ₃ pass-through) and only tested end-to-end, where
+   formula error and rank error alias. Every site where a cumulant enters is a
+   diagram *series*.
+4. **I cited IMPROVEMENTS.md's "our κ₃ closure = 9.6e-6, therefore κ₃ is at its
+   ceiling" without measuring it**, and built a whole decision on it — the same
+   sin the audit was written to prevent.
+5. **I chased rank** (R=16…256 sweeps) before checking whether rank was the
+   binding variable. It wasn't (R=128 ≈ exact carry).
+
+### 4.9.3 ⭐ THE FUSION ARITHMETIC (the reframing that matters)
+
+Two independent estimators fuse to `MSE = b²v/(b²+v)`. The closure costs ~3% of
+budget; QMC takes the rest of the floor (~7% → ~4,600 points → v ≈ 5.1e-6;
+v3 measured 6,400 points → 3.67e-6). To beat v4 (score 3.4e-7):
+
+    b²·v/(b²+v) < 3.4e-6   =>   b² < 1.02e-5
+
+| closure b² | fused MSE | score | vs v4 |
+|---|---|---|---|
+| 1.0e-5 | 3.4e-6 | 3.4e-7 | tie |
+| 5e-6 | 2.5e-6 | 2.5e-7 | **1.35×** |
+| 3e-6 | 1.9e-6 | 1.9e-7 | **1.8×** |
+| 2e-6 | 1.4e-6 | 1.4e-7 | **2.4×** |
+| 1e-6 | 8.4e-7 | 8.4e-8 | **beats the leaders** |
+
+**The closure does NOT need to beat sampling. It needs b² ≲ 3e-6 and
+independence.** v4 already fuses — but its analytic component (calibrated K=2,
+b² = 2.4e-5) is so weak it earns only w = 0.137. A closure at b² ≈ 3e-6 earns
+w ≈ 0.5 and transforms the score. **This is the cheapest lever on the board and
+I nearly walked past it.**
+
+### 4.9.4 Where the analytic κ₃ actually stands (E10, measured)
+
+Complete-diagram closure, κ₃ as a FULL TENSOR (correct physics, 147% of budget):
+
+| max σ edges | L1 | L3 | L7 | L15 | L23 | L31 | end-to-end MSE |
+|---|---|---|---|---|---|---|---|
+| 2 | 10.3% | 20.6% | 19.8% | 28.9% | 34.0% | 41.5% | 6.75e-6 |
+| 3 | 11.0% | 15.9% | 22.0% | 36.3% | 41.3% | 47.5% | 6.23e-6 |
+
+**κ₃ error ACCUMULATES with depth** (~10%/step compounding incoherently over 31
+layers → √31·10% ≈ 56%). The one-step floor with κ₃-blocks-only is 10.6%
+(E9b) — the residual is κ₄(z)-BLOCK-limited, not σ-edge-limited.
+
+**But the error is a systematic MAGNITUDE bias, not a shape error:**
+
+| | L1 | L3 | L7 | L15 | L23 | L31 |
+|---|---|---|---|---|---|---|
+| optimal gain | 0.93 | 1.07 | 1.18 | 1.44 | 1.58 | **1.88** |
+| correlation | 0.9966 | 0.9895 | 0.9868 | 0.9789 | 0.9768 | **0.9719** |
+| resid after gain | 8.2% | 14.4% | 16.2% | 20.4% | 20.4% | 19.9% |
+
+corr stays 0.97-0.997; the gain climbs monotonically to 1.88 — i.e. our κ₃ is
+systematically **too small at depth**, and it COMPOUNDS (1.88 over 31 layers is
+only ~1.02/layer). **A per-layer scalar gain, applied INSIDE the recursion and
+learned offline (the ensemble is weight-exchangeable ⇒ it must be universal),
+attacks the error at source.** Zero in-budget cost.
+
+## 4.10 THE PLAN TO BEAT v4 (cheapest first)
+
+**Target: closure b² ≲ 3e-6 at ≤3% of budget, fused with QMC at ~7%.**
+Projected score 1.9e-7 (1.8× better than v4). Nothing here requires exact κ₃.
+
+**P1 — LEARNED κ₃ SLICES ("precompute and memorise"). Test first: cheapest,
+biggest payoff, no tensor propagation at all.**
+By mean-field universality `κ₃_iij/(σ_i²σ_j)` should be a function of
+`(ρ_ij, t_i, t_j, layer)`. Evidence: S1 measured `corr(γ_i,t_i)=0.92`. Fit the
+map OFFLINE on the corpus to arbitrary precision, ship as a table (0-FLOP load
+via `flopscope.Module`), evaluate at **n² per layer ⇒ ~1% of budget**. That
+leaves ~9% for QMC (v ≈ 4.05e-6). At κ₃≈10% (b²≈2.07e-6) → fused 1.37e-6 →
+**score 1.37e-7 = 2.5× v4.**
+*Gate: regress κ₃_iij on the corpus and report R² / relative error. Hours.*
+
+**P2 — per-layer gain calibration** on the factored (affordable) propagator,
+fitted in-loop and TRANSFERRED to held-out MLPs. Zero in-budget cost. Expect
+κ₃ 20-47% → ~15%. Compose with P1.
+
+**P3 — factored contraction of the ≤2-σ-edge diagrams** (64 families) — only if
+P1/P2 miss. Cost is S·n³/layer, so S ≲ 35 to stay in budget. This is the
+expensive path; do not start it before P1 is measured.
+
+**P4 — κ₄(z) blocks** (needed for the one-step floor below 10.6%): a full κ₄
+tensor is out (n⁴ = 17 GB, n⁵ mode products). Only viable as learned slices —
+i.e. P1 applied to κ₄ as well.
+
+**Deferred: the (μ,Σ) complete formula is DONE and cheap (0.81% of budget) —
+it goes into any submission regardless.**
+
 ## 5. Gating experiments (cheap first; each has an unambiguous verdict)
 
 **E0 — Re-baseline everything (½ day, CPU/GPU).** One canonical
