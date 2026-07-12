@@ -57,24 +57,38 @@ def build_ws(seed):
 
 
 def moments(ws, n_samples, batch):
-    """Accumulate raw moments per layer:  S1, S2=a^T a, S21=(a^2)^T a, S22=(a^2)^T(a^2)."""
-    S1 = [torch.zeros(N_W, dtype=torch.float64) for _ in range(DEPTH)]
-    S2 = [torch.zeros(N_W, N_W, dtype=torch.float64) for _ in range(DEPTH)]
-    S21 = [torch.zeros(N_W, N_W, dtype=torch.float64) for _ in range(DEPTH)]
-    S22 = [torch.zeros(N_W, N_W, dtype=torch.float64) for _ in range(DEPTH)]
+    """Accumulate raw moments per layer for BOTH the post-activation a = ReLU(z)
+    and the PRE-activation z = a_prev @ W.
+
+    The pre-activation cumulants are the ones the diagram formula actually needs:
+    cumulants of ReLU(z) are expressed in terms of cumulants of z. (And note
+    kappa3(z) = W^T-transform of kappa3(a), which requires the FULL n^3 tensor --
+    the n^2 slices of a cannot produce the slices of z. So slices suffice to
+    measure/correct, but not to propagate. Here we sample kappa3(z) directly.)
+    """
+    z_ = lambda: [torch.zeros(N_W, N_W, dtype=torch.float64) for _ in range(DEPTH)]
+    v_ = lambda: [torch.zeros(N_W, dtype=torch.float64) for _ in range(DEPTH)]
+    S1, S2, S21, S22 = v_(), z_(), z_(), z_()              # post-activation a
+    Z1, Z2, Z21, Z22 = v_(), z_(), z_(), z_()              # pre-activation z
     done = 0
     while done < n_samples:
         b = min(batch, n_samples - done)
         x = torch.randn(b, N_W, device=DEV)
         for li, w in enumerate(ws):
-            x = torch.relu(x @ w)
+            z = x @ w
+            z2 = z * z
+            Z1[li] += z.sum(0).cpu().double()
+            Z2[li] += (z.T @ z).cpu().double()
+            Z21[li] += (z2.T @ z).cpu().double()     # E[z_i^2 z_j]
+            Z22[li] += (z2.T @ z2).cpu().double()    # E[z_i^2 z_j^2]
+            x = torch.relu(z)
             x2 = x * x
             S1[li] += x.sum(0).cpu().double()
             S2[li] += (x.T @ x).cpu().double()
             S21[li] += (x2.T @ x).cpu().double()     # E[a_i^2 a_j] (rows i, cols j)
             S22[li] += (x2.T @ x2).cpu().double()    # E[a_i^2 a_j^2]
         done += b
-    return S1, S2, S21, S22
+    return (S1, S2, S21, S22), (Z1, Z2, Z21, Z22)
 
 
 def central(S1, S2, S21, S22, n):
@@ -112,20 +126,26 @@ for m in range(args.n_mlps):
         continue
     t0 = time.time()
     ws = build_ws(seed)
-    S1, S2, S21, S22 = moments(ws, args.samples, args.batch)
+    (S1, S2, S21, S22), (Z1, Z2, Z21, Z22) = moments(ws, args.samples, args.batch)
     rec = {"seed": seed, "n_samples": args.samples,
            "W": torch.stack([w.cpu() for w in ws]).to(torch.float32)}
     mus, covs, k3s, k4s = [], [], [], []
+    zmus, zcovs, zk3s, zk4s = [], [], [], []
     for li in range(DEPTH):
         mu, cov, k3, k4 = central(S1[li], S2[li], S21[li], S22[li], args.samples)
-        mus.append(mu.float())
-        covs.append(cov.float())
-        k3s.append(k3.float())
-        k4s.append(k4.float())
-    rec["mu"] = torch.stack(mus)      # (L, n)
-    rec["cov"] = torch.stack(covs)    # (L, n, n)
-    rec["k3"] = torch.stack(k3s)      # (L, n, n)  kappa3_iij
-    rec["k4"] = torch.stack(k4s)      # (L, n, n)  kappa4_iijj
+        mus.append(mu.float()); covs.append(cov.float())
+        k3s.append(k3.float()); k4s.append(k4.float())
+        zmu, zcov, zk3, zk4 = central(Z1[li], Z2[li], Z21[li], Z22[li], args.samples)
+        zmus.append(zmu.float()); zcovs.append(zcov.float())
+        zk3s.append(zk3.float()); zk4s.append(zk4.float())
+    rec["mu"] = torch.stack(mus)        # (L, n)    post-activation mean
+    rec["cov"] = torch.stack(covs)      # (L, n, n) post-activation covariance
+    rec["k3"] = torch.stack(k3s)        # (L, n, n) kappa3(a_i, a_i, a_j)
+    rec["k4"] = torch.stack(k4s)        # (L, n, n) kappa4(a_i, a_i, a_j, a_j)
+    rec["zmu"] = torch.stack(zmus)      # (L, n)    PRE-activation mean
+    rec["zcov"] = torch.stack(zcovs)    # (L, n, n) PRE-activation covariance
+    rec["zk3"] = torch.stack(zk3s)      # (L, n, n) kappa3(z_i, z_i, z_j)  <- what the
+    rec["zk4"] = torch.stack(zk4s)      # (L, n, n) kappa4(z_i,z_i,z_j,z_j)   formula needs
     torch.save(rec, path)
     mb = path.stat().st_size / 1e6
     print(f"[{m+1}/{args.n_mlps}] seed {seed}: {time.time()-t0:.0f}s, {mb:.0f} MB")
