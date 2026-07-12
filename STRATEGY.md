@@ -769,7 +769,11 @@ only ~1.02/layer). **A per-layer scalar gain, applied INSIDE the recursion and
 learned offline (the ensemble is weight-exchangeable ⇒ it must be universal),
 attacks the error at source.** Zero in-budget cost.
 
-## 4.10 THE PLAN TO BEAT v4 (cheapest first)
+## 4.10 THE PLAN TO BEAT v4 — SUPERSEDED by §4.12 (kept for the reasoning)
+
+> **P1 and P2 below BOTH FAILED — see §4.11. The live plan is §4.12
+> (depth-truncated sampling). Do not restart P1/P2/P3 without reading §4.11.**
+
 
 **Target: closure b² ≲ 3e-6 at ≤3% of budget, fused with QMC at ~7%.**
 Projected score 1.9e-7 (1.8× better than v4). Nothing here requires exact κ₃.
@@ -798,6 +802,141 @@ i.e. P1 applied to κ₄ as well.
 
 **Deferred: the (μ,Σ) complete formula is DONE and cheap (0.81% of budget) —
 it goes into any submission regardless.**
+
+## 4.11 P1 AND P2 BOTH FAILED (measured) — and what that proves
+
+### P1 — learned κ₃ slices from local state: DEAD (E12, 4 s on MPS)
+
+Fit `κ₃_iij/(σ_i²σ_j) = f(t_i, t_j, ρ_ij, layer)` offline on 12 MLPs, evaluated
+on 12 **held-out**:
+
+| features | L1 | L3 | L7 | L15 | L23 | L31 | mean(32) |
+|---|---|---|---|---|---|---|---|
+| local only | **83.9%** | 61.2% | 46.1% | 33.9% | 27.4% | 26.9% | 39.8% |
+| **+ star feature** | **5.7%** | 47.9% | 44.2% | 33.6% | 27.3% | 26.8% | 35.2% |
+| *(propagated tensor, ref)* | *11.0%* | *15.9%* | *22.0%* | *36.3%* | *41.3%* | *47.5%* | — |
+
+1. **The slice is NOT a local function of pairwise statistics.** Obvious in
+   hindsight: the star is `2(CᵀB)_ij + (DᵀW)_ij` with `B = Σ·diag(ĥ₁)·W` — a
+   contraction over p, i.e. **non-local in W and Σ**. My mean-field-universality
+   argument was wrong; `corr(γ_i,t_i)=0.92` only ever supported the DIAGONAL.
+2. Handing the regression the **star** fixes layer 1 completely (83.9% → **5.7%**,
+   inside spec and better than the raw star's 9.5%) — because at L1 z⁰ is exactly
+   Gaussian, so there IS no pass-through and the star is the whole answer.
+3. **Depth is unchanged.** κ₃ at depth depends on ACCUMULATED HISTORY; no function
+   of the current-layer state can recover information that is not in it.
+
+**⇒ κ₃ MUST be propagated. Learned slices cannot substitute — only correct.**
+
+### P2 — per-layer gain calibration: DEAD (E13, 2.7%)
+
+Fitted one shared scalar per layer, in-loop, on the AFFORDABLE (factored, R=64)
+propagator; transferred to 8 held-out MLPs:
+
+| | L1 | L3 | L7 | L15 | L23 | L31 | end-to-end MSE |
+|---|---|---|---|---|---|---|---|
+| uncalibrated | 10.4% | 34.1% | 26.8% | 21.7% | 23.3% | 26.0% | 1.320e-5 |
+| calibrated | 8.7% | 31.8% | 25.9% | 23.7% | 24.4% | 25.4% | **1.284e-5** |
+
+Fitted gains come out ~1.01/layer — because applying the gain **in-loop stops the
+compounding**, so almost none is needed. And once compounding is gone the residual
+is a **shape** error, which a scalar cannot touch.
+
+**The subtlety:** E10's dramatic gain (0.93 → 1.88) was measured on the **tensor**
+closure with **complete** diagrams — that one has a genuine magnitude bias. The
+**affordable factored** closure's error is dominated by leading-diagram
+truncation instead. **Calibration only fixes the error the closure we cannot
+afford has.**
+
+### Score-keeping: four architectures priced and killed in one day
+
+| route | verdict |
+|---|---|
+| conditional-Gaussian / mixture closure | dead (20–280× worse than Edgeworth; saturates in Q) |
+| sampling the cumulant slices | dead (costs 4× a forward pass) |
+| learned local slices (P1) | dead (κ₃ depends on history, not local state) |
+| scalar gain calibration (P2) | dead (2.7%) |
+
+Fusion bar: **b² < 1.02e-5** to beat v4. Affordable closure = **1.284e-5** →
+fused score 3.6e-7, *slightly worse* than v4's 3.396e-7. **We are just on the
+wrong side of the line, and every cheap route to move is now closed.**
+
+## 4.12 ⭐⭐ THE HOLISTIC RETHINK — DEPTH-TRUNCATED SAMPLING (untested, top priority)
+
+### The leaders' numbers fit NEITHER pure story
+
+| | raw MSE | budget | wall | intermediates |
+|---|---|---|---|---|
+| shiv_m (#1) | 8.16e-7 | 9.94% | 27–40 s | zeros |
+| pluto | 9.27e-7 | 9.57% | 20–43 s | zeros |
+| andrew | 3.55e-7 | 26.3% | 4–13 s | all accurate |
+| plain MC @ floor | 6.5e-6 | 10% | — | free |
+| our QMC (v3) | 3.67e-6 | 10% | — | free |
+| our best affordable closure | 1.28e-5 | ~3% | — | free |
+
+Pure sampling cannot get there (our QMC family is exhausted at 3.67e-6). Pure
+kprop cannot either: reaching 8.16e-7 via `c_K(L/n)^K` needs **K ≈ 5**, wildly out
+of budget. **⇒ they are running a HYBRID. I have been treating the two halves as
+competitors instead of composing them.**
+
+### The idea
+
+Everything we have tried samples from **x**, costing `32·2n²` per sample. **We do
+not have to start at the input.**
+
+> **Propagate the distribution analytically to layer k, then SAMPLE from it and
+> run only the remaining (32−k) layers exactly.**
+
+- **Cost/sample collapses to `(32−k)·2n² + n²`** (the `+n²` generates
+  `z = μ + Lξ`). k=24 → 3.5× cheaper; k=28 → 7×; k=30 → 13×. Same budget ⇒ that
+  many more samples ⇒ variance down by the same factor.
+- **The deep ReLUs are handled EXACTLY** — zero closure error in layers k…31,
+  which is precisely where our formulas are worst and where error accumulates.
+- **The bias is the closure's error at layer k**, far smaller than at layer 32
+  because it has not compounded yet.
+
+### The arithmetic lands exactly on the leaders
+
+| k | cost/sample | N at floor | variance term |
+|---|---|---|---|
+| 24 | 1.2e6 | 22,700 | 1.85e-6 |
+| 28 | 5.9e5 | 46,200 | **9.1e-7** |
+| 30 | 3.3e5 | 83,000 | **5.1e-7** |
+| 31 | 2.0e5 | 136,000 | 3.1e-7 |
+
+k = 28–30 lands **exactly** in the leaders' range (8.2–9.3e-7) — and it does so
+with a **K=2-quality closure, which we already have**.
+
+### It also explains both ledgers
+
+- **pluto/shiv:** elementwise-heavy wall (the closure), at the floor,
+  intermediate layers junk because the sampled part only covers the tail.
+- **andrew:** error growing with depth (analytic signature) then an **18× drop at
+  L31 only** — which matches our own E4 measurement that the final-layer cumulant
+  correction is worth 8–30×.
+
+### Why I missed it (and why the logged no-go does NOT apply)
+
+IMPROVEMENTS.md has a "clean negative theorem" killing **depth telescoping**
+(MLMC across layers) and I let it stand. **This is not telescoping.** MLMC needs a
+cheap *surrogate correlated with the full network*. This replaces the *head* with
+an analytic distribution and samples only the *tail* — a biased estimator with a
+much cheaper per-sample cost. Different object, different economics. The no-go
+does not cover it and I never checked.
+
+### The test (cheap, decisive, next thing to run)
+
+For each k:  `MSE(k) = Var_k/N(k) + bias(k)²`, where
+- `N(k) = budget / ((32−k)·2n² + n²)` — pure arithmetic;
+- `bias(k)` = sample from `N(μ̂_k, Σ̂_k)` (**the closure's own state, errors and
+  all**), propagate exactly to the end, compare to truth.
+
+Gives the optimal k and the achievable MSE directly. **Composes with QMC** (use a
+QMC point set at layer k, not iid) **and with the final-layer Edgeworth
+correction** — both already built and validated. Nothing new has to be derived.
+
+**Upside estimate:** k≈28–30 with QMC and a κ₃-corrected final ReLU should land
+below 8e-7 ⇒ score < 8e-8 ⇒ first place. Even a crude version beats v4.
 
 ## 5. Gating experiments (cheap first; each has an unambiguous verdict)
 
