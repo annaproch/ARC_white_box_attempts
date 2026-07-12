@@ -86,9 +86,40 @@ order** — no K in the paper's family reaches their accuracy at any budget we
 measured. Something structurally different is happening, and we must locate
 our error before building anything expensive.
 
+## ERROR ATTRIBUTION — MEASURED (`error_attribution.py`, 6 MLPs)
+
+| component | value | share |
+|---|---|---|
+| total final-layer MSE (plain K=2) | 6.10e-5 | 100% |
+| **(A) propagated-moment error** | **5.98e-5** | **98%** |
+| (B) Gaussian *shape* error at the final ReLU | 1.01e-6 | 1.7% |
+| skew(z₃₁) | ±0.02 | ~Gaussian |
+| ‖Δμ_z‖rms / ‖Δσ_z‖rms | 1.1e-2 / **4.3e-2** | σ is ~4× worse |
+| eig1frac (top-mode share of last hidden layer variance) | **0.55–0.80** | — |
+
+**Conclusions.**
+1. The final pre-activation z is essentially Gaussian (CLT over 256 terms) —
+   the ReLU integral is *fine*. Edgeworth/quadrature fixes to the 1-D marginal
+   are worthless (which retro-explains why K=2.5 bought only 2.3%).
+2. **All the error is in the propagated moments, and mostly in the variance**
+   (~30% relative on σ_z vs ~3% on μ_z).
+3. **Mechanism:** σ_z² = wᵀΣ_a w is dominated by Σ's top eigenvalue, and
+   λ₁ ≈ n · (mean off-diagonal covariance). So a *small systematic bias in the
+   off-diagonal ReLU covariance update is multiplied by n=256 into λ₁ and then
+   compounds multiplicatively over 32 layers* (1%/layer → 1.01³² ≈ 1.37).
+   That is the 30%.
+4. This is precisely the term third cumulants correct — it lives in the
+   **pairwise** structure, not the marginals. It also explains the pattern of
+   our earlier results: a per-layer scalar covariance correction (learned θ)
+   bought 3×, while α-dependent marginal tweaks bought nothing.
+
+**Target is now precise:** kill the systematic off-diagonal bias — either with
+a low-rank κ₃ correction (rank suggested by eig1frac ≈ 1 dominant mode) or a
+richer learned correction to the *pairwise* update, and stop the compounding.
+
 ## The plan
 
-1. **[now] Error attribution at the final ReLU** (`error_attribution.py`).
+1. **[done] Error attribution at the final ReLU** (`error_attribution.py`).
    The final estimate is g(μ̂,σ̂) = σ̂φ(α̂)+μ̂Φ(α̂) on the final pre-activation z.
    Exactly three error sources: (A) wrong propagated moments (μ̂,σ̂), (B) the
    Gaussian *shape* assumption about z (z is skewed), (C) interaction.

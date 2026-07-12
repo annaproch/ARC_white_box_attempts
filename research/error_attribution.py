@@ -97,7 +97,6 @@ def true_final_stats(ws):
     """Sampled moments of the final pre-activation z_31 and the true E[ReLU(z)],
     plus the last hidden layer's covariance spectrum and top-mode skew."""
     wd = [w.float().to(SDEV) for w in ws]
-    n1 = n2 = n3 = None
     s1 = torch.zeros(N_W, dtype=torch.float64)
     s2 = torch.zeros(N_W, dtype=torch.float64)
     s3 = torch.zeros(N_W, dtype=torch.float64)
@@ -111,14 +110,13 @@ def true_final_stats(ws):
         for w in wd[:-1]:
             x = torch.relu(x @ w)
         z = x @ wd[-1]                                   # final pre-activation
-        zd = z.double().cpu()
-        s1 += zd.sum(0)
-        s2 += (zd**2).sum(0)
-        s3 += (zd**3).sum(0)
-        sr += torch.relu(zd).sum(0)
-        xd = x.double().cpu()
-        a_sum += xd.sum(0)
-        a_cov += xd.T @ xd
+        # reduce on-device (float32), move only the small results to CPU float64
+        s1 += z.sum(0).cpu().double()
+        s2 += (z * z).sum(0).cpu().double()
+        s3 += (z * z * z).sum(0).cpu().double()
+        sr += torch.relu(z).sum(0).cpu().double()
+        a_sum += x.sum(0).cpu().double()
+        a_cov += (x.T @ x).cpu().double()
         done += b
     m1 = s1 / GT_N
     var = s2 / GT_N - m1**2
