@@ -18,7 +18,16 @@ import flopscope as flops
 import flopscope.numpy as fnp
 from whestbench import MLP, BaseEstimator
 
-import closure
+# The harness imports estimator.py by path and does NOT put its directory on
+# sys.path, so a bare `import closure` can fail on the grader. Load it by path
+# relative to this file, falling back to a plain import.
+try:
+    import closure
+except ModuleNotFoundError:  # pragma: no cover - grader path
+    _spec = importlib.util.spec_from_file_location(
+        "closure", Path(__file__).resolve().parent / "closure.py")
+    closure = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(closure)
 
 
 def _closure_flops(n: int, depth: int, r: int, r4: int = 8) -> float:
