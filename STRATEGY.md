@@ -861,7 +861,15 @@ Fusion bar: **b² < 1.02e-5** to beat v4. Affordable closure = **1.284e-5** →
 fused score 3.6e-7, *slightly worse* than v4's 3.396e-7. **We are just on the
 wrong side of the line, and every cheap route to move is now closed.**
 
-## 4.12 ⭐⭐ THE HOLISTIC RETHINK — DEPTH-TRUNCATED SAMPLING (untested, top priority)
+## 4.12 THE HOLISTIC RETHINK — DEPTH-TRUNCATED SAMPLING ⛔ TESTED AND DEAD (see §4.13)
+
+> **VERDICT: FAILED.** The reasoning below was right that the leaders must be
+> hybrid, and right that the per-sample cost collapses — but wrong on the
+> decisive point. **Sampling the tail cannot fix the head's bias**: at k=31,
+> sampling N(μ̂,Σ̂) and applying ReLU is *identical* to the analytic Gaussian
+> formula. Measured bias with our closure: **1.37e-4**. Kept below for the
+> reasoning; see §4.13 for the numbers and the general lesson.
+
 
 ### The leaders' numbers fit NEITHER pure story
 
@@ -937,6 +945,83 @@ correction** — both already built and validated. Nothing new has to be derived
 
 **Upside estimate:** k≈28–30 with QMC and a κ₃-corrected final ReLU should land
 below 8e-7 ⇒ score < 8e-8 ⇒ first place. Even a crude version beats v4.
+
+## 4.13 ⛔ E14 — DEPTH-TRUNCATED SAMPLING FAILS (and why it matters anyway)
+
+Measured (`research/e14_depth_truncated.py`, 6 MLPs, 400k samples for the bias;
+sample z^(k) — the PRE-activation, which is near-Gaussian — not a^(k), which is
+non-negative with an atom at 0):
+
+| k | N at floor | bias²(**TRUE** state) | bias²(**CLOSURE** state) | Var/N | MSE(true) | MSE(closure) |
+|---|---|---|---|---|---|---|
+| 0 (= plain MC) | 6,485 | 0 | 0 | 1.17e-5 | 1.17e-5 | 1.17e-5 |
+| 8 | 8,472 | 1.19e-5 | 8.71e-5 | 8.28e-6 | 2.02e-5 | 9.53e-5 |
+| 24 | 24,366 | 6.15e-6 | 1.33e-4 | 3.09e-6 | 9.24e-6 | 1.36e-4 |
+| 30 | 95,892 | 1.91e-6 | 1.36e-4 | 7.89e-7 | 2.70e-6 | 1.37e-4 |
+| **31** | 191,259 | **9.96e-7** | 1.37e-4 | 3.97e-7 | **1.39e-6** | 1.37e-4 |
+
+*(This corpus has higher activation variance than the public split — plain MC
+reads 1.17e-5 here vs 6.5e-6 public. Compare RELATIVELY.)*
+
+### The idea is sound; it is blocked by the same wall
+
+- **With a PERFECT (μ,Σ), k=31 gives 1.39e-6 — 8.4× better than plain MC, exactly
+  the leaders' magnitude.** And its bias (9.96e-7) is *precisely* the K=2
+  representation floor measured independently in E2 (1.205e-6). Two independent
+  routes agreeing yet again.
+- **With our actual closure the bias is 1.37e-4** and swamps everything.
+
+### ⭐ The insight (why no "sample the tail" scheme can ever work)
+
+**At k=31, sampling from N(μ̂,Σ̂) and applying ReLU is MATHEMATICALLY IDENTICAL to
+the analytic Gaussian formula.** Sampling the tail *cannot fix the head's error* —
+it only re-derives, by Monte Carlo, the same number the closure already computes.
+Worse, at small k the closure's state error **AMPLIFIES** when propagated exactly
+(8.71e-5 at k=8, vs 9.5e-5 for the closure's own end-to-end): exact propagation
+destroys the Gaussian closure's partial self-cancellation.
+
+⇒ **A hybrid cannot buy accuracy the closure does not already have.** The sampling
+side can only add *variance reduction*, never *bias reduction*. This closes the
+entire "compose analytic head + sampled tail" family.
+
+## 4.14 THE CHAIN IS NOW AIRTIGHT — everything reduces to κ₃/κ₄ propagation
+
+Five architectures priced and killed in one day, every one by measurement:
+
+| # | route | why it died |
+|---|---|---|
+| 1 | conditional-Gaussian / mixture closure | 20–280× worse than Edgeworth; saturates in Q |
+| 2 | sampling the cumulant slices | costs 4× a forward pass |
+| 3 | learned local slices (P1) | κ₃ depends on accumulated HISTORY, not local state |
+| 4 | scalar gain calibration (P2) | 2.7%; the residual is a shape error |
+| 5 | depth-truncated sampling (E14) | sampling the tail cannot fix the head's bias |
+
+And the surviving chain is fully measured, with no remaining ambiguity:
+
+    oracle closure (true k3+k4, complete formula)   5.59e-7   <- BEATS EVERY LEADER
+    our complete-diagram TENSOR closure             6.2e-6    <- 11x off, and 147% of budget
+    our affordable factored closure                 1.28e-5
+    v4 (QMC + calibrated K=2)                       3.4e-6    <- our submission
+    fusion bar to beat v4                           b^2 < 1.02e-5
+
+The 11× gap between our complete-diagram closure and the oracle is **entirely
+κ₃ propagation error**: 10.6% per step (E9b), compounding incoherently to ~47% by
+L31. And E9b showed that 10.6% one-step floor is **κ₄(z)-BLOCK-limited** — not
+σ-edges (converged at ≤4), not rank (R=128 ≈ exact), not calibration.
+
+> **⇒ THE LEADERS HAVE SOLVED κ₃/κ₄ PROPAGATION. There is no shortcut around it —
+> five have now been tried and closed. The remaining work is exactly one thing:
+> the κ₄(z) blocks in the κ₃ generation, plus an affordable factoring.**
+
+**What κ₄ blocks actually require** (the good news): a κ₄ block in a κ₃(a) diagram
+puts 4 legs on 3 vertices, so we need κ₄ **slices**, not the full n⁴ tensor:
+`κ₄_ppqr` (n³ = 1.7e7 — storable), `κ₄_ppqq`, `κ₄_pppq` (n²), `κ₄_pppp` (n).
+A full κ₄ tensor (n⁴ = 17 GB, n⁵ mode products) is out; the slices are not.
+
+**Runway judgement.** The target is *measured to be achievable* (5.59e-7 → score
+5.6e-8 → first place). But it has now resisted five attempts, and the remaining
+route is a multi-day push. **v4 (3.396e-7) stands as the submission until the
+κ₄-block work clears — do not ship a regression.**
 
 ## 5. Gating experiments (cheap first; each has an unambiguous verdict)
 
