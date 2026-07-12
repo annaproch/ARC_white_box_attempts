@@ -122,8 +122,16 @@ for m in range(args.n_mlps):
     seed = args.seed0 + m
     path = OUT / f"mlp_{seed}.pt"
     if path.exists():
-        print(f"[{m+1}/{args.n_mlps}] seed {seed}: cached, skipping")
-        continue
+        # schema check, not just existence: older records lack the pre-activation
+        # cumulants (zk3/zk4), which are the ones the diagram formula needs.
+        try:
+            cached_ok = "zk3" in torch.load(path, map_location="cpu")
+        except Exception:
+            cached_ok = False
+        if cached_ok:
+            print(f"[{m+1}/{args.n_mlps}] seed {seed}: cached, skipping")
+            continue
+        print(f"[{m+1}/{args.n_mlps}] seed {seed}: stale schema, rebuilding")
     t0 = time.time()
     ws = build_ws(seed)
     (S1, S2, S21, S22), (Z1, Z2, Z21, Z22) = moments(ws, args.samples, args.batch)
