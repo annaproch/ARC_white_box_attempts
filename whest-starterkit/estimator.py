@@ -21,11 +21,13 @@ from whestbench import MLP, BaseEstimator
 import closure
 
 
-def _closure_flops(n: int, depth: int, r: int) -> float:
-    """Analytic FLOP estimate for the K=2+kappa3+kappa4 closure, used to reserve
-    budget before sizing the QMC batch. Dominated by the O(n^3) covariance and
-    star matmuls; the Tucker cores add O(n^2 r + n r^4 + r^5)."""
-    per_layer = 6.0 * n ** 3 + 4.0 * n * n * r + 2.0 * n * r ** 4 + 2.0 * r ** 5
+def _closure_flops(n: int, depth: int, r: int, r4: int = 8) -> float:
+    """Analytic FLOP estimate for the K=2+kappa3+kappa4 closure. Dominated by the
+    O(n^3) covariance and star matmuls; kappa3's core adds O(n r^3) and kappa4's
+    O(n r^4) -- which is why r4 is kept small."""
+    per_layer = (6.0 * n ** 3 + 4.0 * n * n * r
+                 + 2.0 * n * r ** 3 + 2.0 * r ** 4
+                 + 2.0 * n * r4 ** 4 + 2.0 * r4 ** 5)
     return depth * per_layer
 
 POINTS_FILE = "points.npz"
@@ -133,6 +135,7 @@ class Estimator(BaseEstimator):
         self._points = None
         self._theta = None      # (depth, 13) calibrated K3/K4 closure coefficients
         self._rank = 0
+        self._rank4 = 8
         self._n_pts = 0         # QMC points to use alongside the closure
         self._w = None          # 3-way fusion weights [QMC, K2, K3K4], sum = 1
 
@@ -154,6 +157,7 @@ class Estimator(BaseEstimator):
                 self._rank = int(float(meta[0]))
                 self._n_pts = int(float(meta[1]))
                 self._w = [float(meta[2]), float(meta[3]), float(meta[4])]
+                self._rank4 = int(float(meta[5])) if meta.shape[0] >= 6 else 8
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         width, depth = mlp.width, mlp.depth
@@ -167,7 +171,8 @@ class Estimator(BaseEstimator):
         # only written when that beats v4 -- so this path cannot regress us.
         analytic = None
         if self._theta is not None and shape_ok:
-            analytic = closure.predict_final_mean(mlp, self._theta, self._rank)
+            analytic = closure.predict_final_mean(mlp, self._theta, self._rank,
+                                                  self._rank4)
             if analytic is not None:
                 chk = fnp.asarray(analytic, dtype=fnp.float64)
                 if not bool(fnp.all(fnp.isfinite(chk))) or float(fnp.max(fnp.abs(chk))) > 10.0:

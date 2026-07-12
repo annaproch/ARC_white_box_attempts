@@ -83,7 +83,7 @@ def _wick_cov(a, pdf, cdf, s, rho):
     return fnp.outer(s, s) * acc
 
 
-def predict_final_mean(mlp, theta, rank):
+def predict_final_mean(mlp, theta, rank, rank4=8):
     """Final-layer mean via the calibrated K=2 + kappa3 + kappa4 closure.
 
     theta: (depth, 13) array of calibrated coefficients (zeros => uncalibrated).
@@ -94,6 +94,7 @@ def predict_final_mean(mlp, theta, rank):
     if theta is None or theta.shape[0] != depth or theta.shape[1] != N_PARAMS:
         return None
     r = int(rank)
+    r4 = min(int(rank4), r)
     eye = fnp.eye(n, dtype=fnp.float32)
 
     W0 = mlp.weights[0]
@@ -101,7 +102,9 @@ def predict_final_mean(mlp, theta, rank):
     S = fnp.matmul(W0.T, W0)                      # z_0 = W0^T x,  x ~ N(0, I)
     V = _top_basis(S, r)
     T3 = fnp.zeros((r, r, r), dtype=fnp.float32)
-    T4 = fnp.zeros((r, r, r, r), dtype=fnp.float32)
+    T4 = fnp.zeros((r4, r4, r4, r4), dtype=fnp.float32)  # kappa4: smaller rank
+    # kappa4's core costs O(n r^4): at r=32 it alone is 8.4% of budget, which
+    # doubles the score multiplier. kappa4 is ~rank-1 at depth, so r4 << r.
     star = None                                   # (h2, h3, Wr, Bs) in z_l space
 
     for li in range(depth):
@@ -122,9 +125,11 @@ def predict_final_mean(mlp, theta, rank):
         P3 = fnp.matmul(G2, fnp.reshape(T3, (r * r, r)))
         k3_slice = fnp.matmul(P3, V.T)
         k3_diag = fnp.sum(P3 * V, axis=1)
-        P4 = fnp.matmul(G2, fnp.reshape(T4, (r * r, r * r)))
-        k4_slice = fnp.matmul(P4, G2.T)
-        k4_diag = fnp.sum(P4 * G2, axis=1)
+        V4 = V[:, :r4]
+        G2b = fnp.reshape(V4[:, :, None] * V4[:, None, :], (n, r4 * r4))
+        P4 = fnp.matmul(G2b, fnp.reshape(T4, (r4 * r4, r4 * r4)))
+        k4_slice = fnp.matmul(P4, G2b.T)
+        k4_diag = fnp.sum(P4 * G2b, axis=1)
         if star is not None:
             h2s, h3s, Wr, Bs = star
             C3 = h2s[:, None] * Wr * Bs
@@ -168,8 +173,9 @@ def predict_final_mean(mlp, theta, rank):
 
         Z = h1[:, None] * fnp.matmul(W, V_next)
         M = fnp.matmul(Z.T, V)
+        M4 = M[:r4, :r4]
         T3 = c["c3p"] * fnp.einsum("mkl,am,nk,ol->ano", T3, M, M, M)
-        T4 = c["c4p"] * fnp.einsum("mklp,am,nk,ol,qp->anoq", T4, M, M, M, M)
+        T4 = c["c4p"] * fnp.einsum("mklp,am,nk,ol,qp->anoq", T4, M4, M4, M4, M4)
 
         if star is not None:                        # compress the old star forward
             h2s, h3s, Wr, Bs = star
@@ -178,7 +184,8 @@ def predict_final_mean(mlp, theta, rank):
             U3 = fnp.einsum("i,im,ik,il->mkl", h2s, A, Bv, Bv)
             T3 = T3 + c["c3g"] * (U3 + fnp.transpose(U3, (1, 0, 2))
                                   + fnp.transpose(U3, (1, 2, 0)))
-            U4 = fnp.einsum("i,im,ik,il,ip->mklp", h3s, A, Bv, Bv, Bv)
+            A4, Bv4 = A[:, :r4], Bv[:, :r4]
+            U4 = fnp.einsum("i,im,ik,il,ip->mklp", h3s, A4, Bv4, Bv4, Bv4)
             T4 = T4 + c["c4g"] * (U4 + fnp.transpose(U4, (1, 0, 2, 3))
                                   + fnp.transpose(U4, (1, 2, 0, 3))
                                   + fnp.transpose(U4, (1, 2, 3, 0)))
