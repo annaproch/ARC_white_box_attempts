@@ -20,3 +20,9 @@ whest-starterkit/.git-upstream/
 
 # sampled moment corpus (large, regenerable)
 data/
+
+# session artifacts (large / regenerable)
+whest-starterkit/*.log
+research/*.log
+data/slice_cache/
+flopscope/

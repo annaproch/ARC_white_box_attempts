@@ -100,15 +100,48 @@ def _wick_cov(a, pdf, cdf, s, rho):
     return fnp.outer(s, s) * acc
 
 
-def predict_all_layers(mlp, theta, rank, rank4, q0, no_k4=False):
+def predict_all_layers(mlp, theta, rank, rank4, q0, no_k4=False, anchor=None):
     """All-layer means (depth, width) via the closure -- for a PURE-ANALYTIC
     estimator (no sampling at all). The closure already computes mu at every
     layer; returning them costs nothing extra."""
     return predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=True,
-                             no_k4=no_k4)
+                             no_k4=no_k4, anchor=anchor)
 
 
-def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=False):
+# --- ANCHOR (A1): per-layer polynomial correction of the kappa3 slice.
+# Features (must match research/a1_anchor.py EXACTLY): deg-3 monomials in
+# (t_i, t_j, rho_ij), then {carried_slice, star} each x {1, low-order monomials}.
+# Cost ~0.07% of budget. anchor=None => bit-identical to the grader-proven path.
+_EXPS = [(a, b, c) for a in range(4) for b in range(4) for c in range(4)
+         if a + b + c <= 3]
+_LOW = [i for i, e in enumerate(_EXPS) if sum(e) <= 2]
+N_ANCHOR = len(_EXPS) + 2 * (1 + len(_LOW))
+
+
+def _anchor_feats(t, rho, prop_n, star_n, n):
+    ti = fnp.broadcast_to(t[:, None], (n, n))
+    tj = fnp.broadcast_to(t[None, :], (n, n))
+    cols = []
+    for (a, b, c) in _EXPS:
+        col = fnp.ones((n, n), dtype=fnp.float32)
+        for _ in range(a):
+            col = col * ti
+        for _ in range(b):
+            col = col * tj
+        for _ in range(c):
+            col = col * rho
+        cols.append(fnp.reshape(col, (n * n,)))
+    X = fnp.stack(cols, axis=1)                      # (n^2, P)
+    blocks = [X]
+    for ex in (prop_n, star_n):
+        ev = fnp.reshape(ex, (n * n, 1))
+        blocks.append(ev)
+        blocks.append(ev * X[:, _LOW])
+    return fnp.concatenate(blocks, axis=1)           # (n^2, N_ANCHOR)
+
+
+def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=False,
+                       anchor=None):
     """Final-layer mean via the calibrated K=2 + kappa3 + kappa4 closure.
 
     theta: (depth, 13) array of calibrated coefficients (zeros => uncalibrated).
@@ -151,6 +184,7 @@ def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=Fals
         G2 = fnp.reshape(V[:, :, None] * V[:, None, :], (n, r * r))
         P3 = fnp.matmul(G2, fnp.reshape(T3, (r * r, r)))
         k3_slice = fnp.matmul(P3, V.T)
+        k3_carried = k3_slice                       # the ANCHOR's key feature
         k3_diag = fnp.sum(P3 * V, axis=1)
         if no_k4:
             k4_slice = fnp.zeros((n, n), dtype=fnp.float32)
@@ -161,11 +195,13 @@ def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=Fals
             P4 = fnp.matmul(G2b, fnp.reshape(T4, (r4 * r4, r4 * r4)))
             k4_slice = fnp.matmul(P4, G2b.T)
             k4_diag = fnp.sum(P4 * G2b, axis=1)
+        k3_star = fnp.zeros((n, n), dtype=fnp.float32)
         if star is not None:
             h2s, h3s, Wr, Bs = star
             C3 = h2s[:, None] * Wr * Bs
             D3 = h2s[:, None] * Bs * Bs
-            k3_slice = k3_slice + 2.0 * fnp.matmul(C3.T, Bs) + fnp.matmul(D3.T, Wr)
+            k3_star = 2.0 * fnp.matmul(C3.T, Bs) + fnp.matmul(D3.T, Wr)
+            k3_slice = k3_slice + k3_star
             k3_diag = k3_diag + 3.0 * fnp.sum(h2s[:, None] * Wr * Bs * Bs, axis=0)
             if not no_k4:
                 C4 = h3s[:, None] * Wr * Bs
@@ -174,6 +210,15 @@ def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=Fals
                             + 2.0 * fnp.matmul(D4.T, Wr * Bs))
                 k4_diag = k4_diag + 4.0 * fnp.sum(h3s[:, None] * Wr * Bs * Bs * Bs,
                                                   axis=0)
+
+        # ---- ANCHOR: learned per-layer correction of the kappa3 slice (A1).
+        # Applied AFTER carried+star, BEFORE the moment update -- exactly as in
+        # research/a1_anchor.py, whose coefficients these are.
+        if anchor is not None:
+            nrm3 = fnp.outer(var, s)                       # s_i^2 s_j
+            F = _anchor_feats(a, rho, k3_carried / nrm3, k3_star / nrm3, n)
+            k3_slice = k3_slice + fnp.reshape(
+                fnp.matmul(F, anchor[li]), (n, n)) * nrm3
 
         # ---- corrections, dimensionless (no 1/sigma^k intermediate is formed)
         t3 = k3_diag / var

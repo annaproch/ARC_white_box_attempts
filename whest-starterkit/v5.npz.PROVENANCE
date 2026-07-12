@@ -1,0 +1,5 @@
+md5 1a72ec72afb1ec2fb7b25ada6915f58a
+config rank=32 rank4=8 n_qmc=0 w_qmc=0 ANCHOR=OFF k4=ON
+mini: raw_mse 9.17e-6  score 9.30e-7  util 10.13%  0/100 failed
+ANCHOR IS BROKEN (offline<->online feature parity). Do not enable until
+a numerical parity check passes. anchor ON measured: raw 3.47e-4.

@@ -1194,6 +1194,485 @@ what makes downstream cumulant corrections mismatched.
 
 ## 7. Progress log (append-only)
 
+---
+
+## ⭐ 2026-07-12 EVENING — THE BUILD ATTEMPT: what was tried, what broke, where it stands
+
+*Read this section before touching the estimator. It supersedes the optimistic
+projections above it. Four of my own constructions were BROKEN and only found
+by measurement; the numbers that survived are marked ✅.*
+
+### 7.A The chain of reasoning that got us here
+
+1. **The moment update reads ONLY the κ₃ slice** (`relu_step_full` takes n²
+   slices, never the tensor). ⇒ **the κ₃(z)_ppq slice error IS the whole
+   problem.** Oracle slice ⇒ 3.8–4.5e-7 end-to-end (beats every leader).
+   Our propagated slice: ~25–34%. Needed: ~5–15%.
+2. My **"anchoring law" (e = √(ε·a))** was the WRONG FRAME and is RETRACTED.
+   There is no √L compounding in the quantity that matters, because the moment
+   update re-reads a fresh slice every layer. The anchor IS the slice estimator;
+   its error sets the end-to-end MSE directly.
+3. ⇒ **The build: core carry (history) + a LEARNED per-layer map that corrects
+   the carried slice (the "anchor") + learned κ₄ slices + QMC fusion.**
+
+### 7.B ✅ WHAT IS MEASURED AND TRUSTED
+
+| result | value | where |
+|---|---|---|
+| Diagram slice evaluator ≡ full-tensor einsum | **1e-16** | `g2_k4_blocks.py --verify` |
+| Compiled batched evaluator ≡ per-diagram loop | **1e-15** | same |
+| Fast moment engine: **no bias** vs old path | at noise floor | `fastmoments.py --validate` |
+| CP algebra ≡ dense tensor propagation | **2.4e-7** | `derisk_cp.py --verify` |
+| **D1: core (Tucker) carry slice error** | **exact 25.7% / R=32 34.0%** | `d1_backbone.py` |
+| **D2: uncompressed CP carry** | **24.2%** — corroborates D1 | `derisk_cp.py --sweep` |
+| **A1: anchor on the SHIPPABLE R=32 carry** | **32.0% → 23.5%**, b² 3.0e-5 → **1.95e-5** | `a1_anchor.py` |
+| v5 priced (closure 4.18% + anchor 0.12% + QMC) | **8.15% of B** | flopscope |
+| κ₄ core (r4=8) cost — *bigger than expected* | **0.90% of B** | flopscope audit |
+
+**THE BLOCKING NUMBER: b² = 1.95e-5. The fusion bar to beat v4 is b² < 1.02e-5.
+We are 1.9× short. There is currently NO submission that beats v4 (3.396e-7).**
+
+### 7.C ⛔ FOUR OF MY OWN CONSTRUCTIONS WERE BROKEN (all found by measurement)
+
+1. **The CP carry ansatz was structurally incapable.** I wrote `κ₃ ≈ (V∘V)diag(c)Vᵀ`
+   — a symmetric CP, `u⊗u⊗u`. But **the star is `Σᵢ h₂(i)·sym(aᵢ⊗bᵢ⊗bᵢ)` — TWO
+   distinct vectors.** The ansatz cannot represent it AT ANY RANK. It carried
+   noise; a fitting run reached 83% slice error / 130% κ₄ before I noticed.
+2. **The star was attached to the WRONG LAYER.** The star built from Σ(z^l),
+   h₁/h₂(z^l) and **W[l+1]** belongs to κ₃(z^{l+1}) — it goes into the carry for
+   the NEXT layer, not into κ₃(z^l). E12's `star_slice` had it right; I
+   re-derived instead of reading, and got it wrong.
+3. **A1 v1 tested a strawman.** I fitted a single SHARED 7-feature LINEAR ridge
+   while G5's 15.7% came from a **per-layer degree-3 polynomial** ridge. The
+   right model class is affordable (~0.06% of B). Fixed → 23.5%.
+4. **`k4_iiii` was zeroed** in A1 — it is literally the diagonal of the corpus's
+   `k4_iijj`, and it drives the LARGEST κ₄ term in the mean update. Restored
+   (turned out not to be the blocker: 1.85e-5 → 1.95e-5, no change).
+
+**Root cause (process):** I verified my *measurements* and trusted my
+*constructions*. Every gate had a falsification test; nothing I *built* did.
+**RULE ADOPTED: any component that carries or transforms state gets a
+ground-truth test BEFORE it is used in a fit. And never reimplement existing
+validated code without reading it first.**
+
+### 7.D ⛔ DEAD ENDS ESTABLISHED TODAY (do not retry)
+
+| route | why it died | evidence |
+|---|---|---|
+| **Magnitude-pruned CP carry** | 24.2% (all terms) → **76% @ R=256, 93% @ R=64**. The tensor's low-rank structure lives in the **SUBSPACE**, not in a sparse subset of star terms — the good rank-1 approx is a *linear combination*, so no term selection finds it. Subspace compression **provably becomes a core** (an r³ core falls out of the algebra). | `derisk_cp.py --sweep` |
+| **Full (uncompressed) CP carry** | exact, but transport+slice ≈ **26% of budget** ⇒ multiplier 0.26 ⇒ kills the score | arithmetic |
+| **R=64 core carry** | better slice (29.4%) but flopscope-measured at **10% of B** ⇒ off the table | IMPROVEMENTS + D1 |
+| **κ₄ BLOCKS in κ₃ generation** | WORK (per-step κ₃ 10.3%→3.8%, replicated L3/L7/L15, survives 30% κ₄ noise) but the win comes **entirely from the (2,1,1) block, which needs the n³ κ₄_ppqr**. The n²-leg blocks G1 can learn are **worse than nothing** (13.95% vs 13.14%). Dense cost **1203% of B**. | G2 + ablation |
+| **"Anchoring law" √(ε·a)** | wrong frame (see 7.A.2). Retracted. | — |
+
+### 7.E WHERE IT STANDS / WHAT IS UNTRIED
+
+`estimator.py` = **grader-proven `closure.py` (Tucker core, R=32) + the learned
+anchor + QMC fusion**, priced at **8.15% of B**, `whest validate` passes.
+`v5.npz` carries the REAL A1 coefficients (32×42). **It does NOT beat v4** —
+it is a WIP that carries measured numbers. v4 is preserved at
+`_archive/estimator_v4.py`. The stale `closure.npz` (w_qmc=0, which silently
+forced the pure-analytic path) is archived.
+
+**To cross the bar the slice must go 23.5% → ~12–15%. Untried, cheap levers:**
+1. **More training data** — A1 fitted on **FOUR of 64 available corpus MLPs**.
+   G5's curve was still improving with data (17.7% @2 → 15.7% @4).
+2. **Richer features** — the map sees only (t_i, t_j, ρ, carried slice, star).
+   The κ₄ slice, h₁/h₂ gains and Σ-spectrum are **already computed at inference**
+   ⇒ free to add.
+3. **Replace the κ₄ CORE with a learned κ₄ MAP** — the core costs **0.90% of B**;
+   G1c showed learned κ₄ slices work at 28.5% for ~0.19%. Frees ~0.7% for QMC.
+
+### 7.F ⛔⛔ THE TRANSFER TEST FAILED — OFFLINE DOES NOT PREDICT THE GRADER
+
+**Before investing in more training, we ran the pure closure (anchor ON, no QMC)
+on the mini split. The result invalidates the offline harness:**
+
+| | offline prediction | **ACTUAL (mini, 100 MLPs)** |
+|---|---|---|
+| raw final-layer MSE | 1.0–1.2e-5 (b²=1.95e-5 ÷ 1.8 corpus/public variance) | **3.47e-4** |
+| score | ~1.1e-6 | **3.47e-5** |
+| utilization | 4.3% | 6.26% |
+| failed MLPs | — | 0/100 |
+
+**30× worse than predicted.** For reference the OLD calibrated closure scored
+1.19e-5 raw on mini, and even the UNCALIBRATED one was ~4.6e-5 — so 3.47e-4 is
+worse than *anything* previously measured. This is not a small transfer gap; it
+is a broken pipeline.
+
+**Prime suspect — the parity blocker I flagged and never checked (#2).** The
+anchor coefficients were fitted against `research/a1_anchor.py`'s features, but
+`whest-starterkit/closure.py` computes them **differently**:
+- `closure.py` CLIPS `t = clip(m/s, ±12)` and `rho = clip(S/ss, ±1)`; A1 does not.
+- its `k3_carried = P3·Vᵀ` and `k3_star` may differ in basis/scale from
+  `K3State.slices()` / A1's star.
+- `closure.py` uses its own Wick series + `theta` calibration (shipped as ZEROS
+  here), while A1 uses `harness.relu_step_full` (the complete diagram formula).
+If the features differ, the fitted coefficients multiply the WRONG quantities —
+which produces exactly this blow-up.
+
+**RULE (should have been enforced before any fit): an offline fit may not be
+shipped until a NUMERICAL PARITY CHECK shows the offline mirror and the
+flopscope estimator produce the same features and the same slice on the same
+MLP.** This is the single cheapest check in the whole pipeline and skipping it
+cost a full build cycle.
+
+**Diagnostic in flight:** the same closure with the anchor OFF. If it lands near
+~4.6e-5 (uncalibrated closure), the anchor is the culprit and the fix is parity.
+If it is ALSO ~3e-4, then `closure.py` with `theta=0` is itself broken/miscalled
+and the anchor is innocent.
+
+**⇒ DO NOT INVEST IN MORE TRAINING UNTIL OFFLINE b² AND THE MINI RAW MSE AGREE.**
+Every projected number in 7.B/7.E is suspect until that holds.
+
+### 7.G ⛔⛔⛔ ARTIFACT CHAOS — THE RESULTS BECAME IRREPRODUCIBLE (my fault)
+
+**This is the most important process failure of the whole project. Read it before
+touching an estimator artifact.**
+
+I wrote `v5.npz` **EIGHT times** in one session, and **four of those writes were
+`np.savez` round-trips of a file that `flopscope.Module.save()` had produced.**
+The Module format carries a `__meta__` entry; round-tripping it through
+`dict(np.load(...))` → `np.savez(...)` is not guaranteed to preserve what
+`Module.from_file()` expects. I also edited the file **in place while runs were
+launching.**
+
+**The full write log (reconstructed):**
+
+| # | writer | schema | meta after |
+|---|---|---|---|
+| 1 | `price_v5.py` | OLD (CP-carry estimator): random placeholders | `[64, 4000, .5, .5, 1, 1]` |
+| 2 | ledger script | `np.savez` ×4 | `[64, 2500, …]` |
+| 3 | rewrite for `closure.py` — `Module.save()` | NEW: theta=**zeros**, anchor=**A1 real coefs**, q0=**random** | `[32, 8, 4000, .5, 1, 1]` |
+| 4 | FLOP-ledger | `np.savez` ×4 | `[32, 8, 2500, .5, 1, 1]` |
+| 5 | transfer test | `np.savez` | `[32, 8, 0, 0, 1, 1]` → **RUN 1: 3.47e-4, util 6.26%** |
+| 6 | control | `np.savez` | `[32, 8, 0, 0, 0, 1]` → **RUN 2: 9.17e-6, util 10.13%** |
+| 7 | "pin" | `np.savez` — **identical meta to #6** | `[32, 8, 0, 0, 0, 1]` → **RUN 3: 3.52e-4, util 4.81%** |
+| 8 | staged | `np.savez` | `[32, 8, 4000, .5, 1, 1]` (never run) |
+
+**⚠️ Writes #6 and #7 are byte-identical in intent, yet their runs differ 38× in
+MSE and 5.3 points in utilization.** Utilization CANNOT differ for the same
+config (the anchor is 0.12% of B). So the artifact on disk was NOT what I
+believed. **Every score I attributed to a config tonight is therefore void.**
+
+### 7.H ⛔ THE 9.17e-6 WAS A MIRAGE — I reported the SAMPLER's score as the CLOSURE's
+
+RUN 2 (9.17e-6 @ 10.13% util) is arithmetically explained as:
+  closure 4.3% + **2,500 QMC points 3.9%** + residual ~2% = 10.1% ✓
+and **2,500 QMC points alone give ≈ 3.67e-6 × (6400/2500) ≈ 9.4e-6 ≈ the 9.17e-6
+measured.** My estimator sets `w_qmc = 1.0` whenever the closure GUARD TRIPS —
+so the closure blew its envelope, we fell back to pure sampling, and I read the
+sampler's number as "the best pure-analytic result the project has produced" and
+built a whole plan on it (calibration ×3 + anchor ×1.5 ⇒ beats v4).
+
+**The tell I ignored: the utilization.** 10.13% vs 6.26% for configs that differ
+only by a 0.12% flag. I had the number in front of me and did not check it.
+
+**What is actually reproducible:** RUNS 1, 3 and the user's run all land at
+**~3.5e-4, anchor ON *or* OFF** ⇒ **the closure path in my `estimator.py` is
+broken independent of the anchor.** Prime suspects, in order:
+1. **My edits to `closure.py`** (adding the anchor plumbing, splitting
+   `k3_carried`/`k3_star`) broke grader-proven code.
+2. **`theta = zeros` + `q0 = random`** — the shipped closure used a TRAINED theta
+   and a SHIPPED q0 block. The previously-known *uncalibrated* closure measured
+   ~4.6e-5, an order of magnitude better than my 3.5e-4.
+3. The `np.savez` corruption above.
+
+### 7.I RULES ADOPTED (non-negotiable from here)
+
+1. **Artifacts are written by `Module.save()` ONLY.** Never `np.savez` a file that
+   `Module.save()` produced.
+2. **One file per config. Never edit an artifact in place. Never while a run is
+   live.** Each gets an md5 + the result it produced.
+3. **`setup()` PRINTS what it loaded** (file, md5, flags, theta magnitude). A
+   score that cannot name the artifact that produced it does not exist.
+4. **Always run the CONTROL** (QMC-only). If the control doesn't reproduce its
+   known value, the harness is lying and no other number means anything.
+5. **Read the utilization before believing the MSE.** A cost that doesn't match
+   the config means a different code path ran.
+6. **A fallback that silently substitutes a different estimator is a TRAP.** The
+   guard's `w_qmc = 1.0` fallback made a broken closure look like a great one.
+   Fallbacks must be COUNTED and REPORTED, not silent.
+
+### 7.J ⛔⛔⛔⛔ ROOT CAUSE FOUND — I SHIPPED ZEROS AND NOISE
+
+**The closure was never broken. I fed it garbage parameters.**
+
+| param | archived `closure.npz` (GOOD) | what I shipped in `v5.npz` |
+|---|---|---|
+| `theta` (per-layer calibration) | **trained**, absmax **0.0465** | **ALL ZEROS** |
+| `q0` (subspace-iteration start block) | **shipped**, absmax **3.9148** | **RANDOM NOISE**, absmax 0.24 |
+
+So every mini run tonight executed an **uncalibrated closure with a corrupted
+Tucker-basis seed**. Calibration alone was historically worth **3×**, and a
+random `q0` poisons the eigenbasis the entire κ₃ carry is built on. That is the
+3.5e-4 — not physics, not the anchor, not parity. **`git diff` confirms my edits
+to `closure.py` are additive only (`anchor=None` preserves the original path),
+so the closure math was intact the whole time.**
+
+**Everything I concluded from the estimator tonight is VOID:**
+- ⛔ "the closure produces 3.5e-4 / is broken" — it was running on zeros+noise
+- ⛔ "the anchor is broken by feature parity" — never tested on a WORKING closure
+- ⛔ "9.17e-6 is the best pure-analytic result" — it was pure QMC after a guard trip
+
+**What SURVIVES (all measured offline via `k3prop`/`harness`/verified evaluators,
+never through `closure.py`):** G2 (κ₄ blocks cut per-step κ₃ error 2.2–2.9×),
+G1c (learned κ₄ → 4.52e-7 vs 3.84e-7 oracle), D1/D2 (core carry 25.7% exact /
+34% @R=32), A1 (anchor 32%→23.5%, b² 3.0e-5→1.95e-5), derisk_cp (CP algebra
+exact; magnitude pruning dead), and every machine-verified evaluator.
+
+**⚠️ ONE UNRESOLVED GAP:** A1's b² was measured with `harness.relu_step_full` +
+`K3State` — a **DIFFERENT CODEPATH from `closure.py`**. So A1 describes a
+different closure than the shipped one. Until a numerical parity check is run,
+A1's numbers do NOT transfer to the estimator.
+
+### 7.K THE RE-RUN QUEUE (nothing is known until these land)
+
+Configs are built as separate `Module.save()` artifacts (`cfg_*.npz`), swapped in
+by `cp cfg_X.npz v5.npz`. Run in this order:
+
+| # | config | expects | decides |
+|---|---|---|---|
+| 1 | **G** `cfg_G_TRAINED_noanchor` (trained θ + shipped q0, no anchor, no QMC) | **~1.19e-5 raw / 1.2e-6** | **SANITY. If this does not reproduce, `closure.py` (or my edit) is broken and nothing else is worth running.** |
+| 2 | **F** `cfg_F_qmc_only` (QMC only) | ~3.7e-6 | certifies the harness + estimator plumbing |
+| 3 | **H** `cfg_H_TRAINED_anchor` (G + anchor) | ~8e-6 if the anchor's 1.5× transfers | the first HONEST anchor test |
+| 4 | **I** `cfg_I_TRAINED_qmc` (G + QMC 2500 @ w=0.35) | — | can it beat v4 (3.66e-6 raw / 3.66e-7)? |
+
+**BARS:** pure-analytic must reach **raw < 3.4e-6** to beat v4 at the floor;
+fused, the closure must earn its ~4.3% budget.
+
+### 7.L THE PROCESS LESSON (the real deliverable of this session)
+
+Six mistakes, one pattern: **I verified my measurements and trusted my
+constructions.** Every gate (G1/G2/G5/D1) had a falsification criterion and was
+machine-checked. Nothing I *built* did — not the CP carry (structurally
+incapable), not the star's layer alignment, not the artifact writes, not the
+shipped parameters. The signals were all visible: the utilization mismatch
+(10.13% vs 4.81% for a 0.12% flag), `theta` being all zeros, a fallback silently
+substituting the sampler.
+
+**Non-negotiable from here:**
+1. Artifacts written by `Module.save()` ONLY. One file per config. Never edited in place.
+2. Every run PRINTS the artifact md5 + flags it loaded. A score that cannot name
+   its artifact does not exist.
+3. **Always run the control** (QMC-only). If the control doesn't reproduce, nothing else means anything.
+4. **Read the utilization before believing the MSE.**
+5. **Silent fallbacks are traps** — count and report every guard trip.
+6. **Any component that carries or transforms state gets a ground-truth test
+   BEFORE it is used in a fit.**
+7. **Never reimplement existing validated code without reading it first.**
+
+**Status: v4 (3.396e-7) preserved at `_archive/estimator_v4.py` and remains the
+ONLY trustworthy submission. `estimator.py` = v5 WIP; `v5.npz` = config G,
+awaiting the sanity run.**
+
+---
+
+
+- **2026-07-12 ⭐ THE κ₄ CONFUSION, RESOLVED — and it reorders the program.**
+  The user caught me conflating two DIFFERENT roles of κ₄. They are independent
+  and must never be merged again:
+  | | what | measured by | worth |
+  |---|---|---|---|
+  | **Role 1** | κ₄ **slices** in the **moment update** (mean + cov of ReLU(z)) | E2/E5/E6, **G1/G1c** | **16×** (G1c: dropped 6.18e-6 → oracle 3.84e-7) |
+  | **Role 2** | κ₄ **blocks** inside κ₃ **generation** | §4.14's claim, **G2** | smoke says **~0** |
+  A G2 null does NOT devalue κ₄ — Role 1 is where its 16× lives.
+  **⚠️ BUT read E6's spec table BY ROW and the real ordering appears:**
+  at κ₃=2%, κ₄ 0%→20% costs 2× (5.73e-7 → 1.04e-6); **at κ₃=20%, κ₄ is worth
+  NOTHING** (7.07e-6 vs 7.38e-6). **κ₄ only cashes in AFTER κ₃ is fixed.** Our
+  affordable κ₃ is 26–47% at depth ⇒ G1c's κ₄ win is BANKED, NOT SPENT, and
+  **κ₃ is the sole critical path.** (Caveat: E6's table is itself noisy —
+  non-monotonic in κ₄ at fixed κ₃ — so use it as order-of-magnitude only.)
+
+- **2026-07-12 (G1c RESULT — learned κ₄ works, at oracle κ₃).** 12 held-out
+  MLPs, N=8e6, complete-formula propagation (`research/g1c_learned_k4_endtoend.py`):
+  | cell | final MSE |
+  |---|---|
+  | plain K=2 | 7.32e-5 |
+  | oracle κ₃ + **oracle κ₄** (ceiling) | **3.84e-7** |
+  | oracle κ₃ + **learned κ₄_iijj** (rest oracle) | **4.52e-7** (1.18× off ceiling) |
+  | oracle κ₃ + **all κ₄ learned** | 1.88e-6 |
+  | oracle κ₃ + κ₄ **dropped** | 6.18e-6 |
+  Held-out slice errors: iijj **28.5%**, iiij 50.2%, iiii 31.0%.
+  **A 28.5%-wrong κ₄_iijj costs only 18% of the ceiling** — the tolerance is even
+  looser than E6 claimed. The dominant κ₄ family is SOLVED by an n² learned map
+  (~0.2% of budget, priced in the skeleton). Weak links: iiij (50%, still partly
+  target-noise) and iiii. Next cheap cells (cache is warm): iiij ORACLE vs iiij
+  DROPPED, to see whether a badly-learned iiij is worse than none.
+
+- **2026-07-12 ⭐⭐ G2 — THE κ₄ BLOCKS BREAK THE FLOOR. §4.14 CONFIRMED.**
+  `research/g2_k4_blocks.py`. Two things had to be built first:
+  (a) **the question was UNTESTABLE as written** — `diagrams.eval_diagram` feeds
+  κ₄ to einsum as a full n⁴ tensor (17 GB at n=256, ~3e16 FLOPs to build). That
+  is why E9b never ran it and the "κ₄-block-limited" claim sat unverified for
+  days. Exploiting "4 legs on ≤3 vertices" (§4.14), the largest object needed is
+  **κ₄_ppqr, n³ = 67 MB**. New slice-aware evaluator, **machine-verified against
+  the full-tensor einsum to 1e-16** across every truncation (to 172k diagrams).
+  (b) a streaming Khatri-Rao moment engine (see the tooling entry).
+
+  **RESULT (n=256, MLP 0, layer 3, N=4e6; truth-noise floor 2.72%):**
+  | truncation | #diag | rel err |
+  |---|---|---|
+  | star only (SHIPPED today) | 3 | 68.98% |
+  | GEN + pass-through, 2σ | 64 | 13.58% |
+  | + 3σ | 156 | 10.29% ← *E9b's "floor"* |
+  | + 4σ | 303 | 10.28% |
+  | GEN + pass + **κ₄ BLOCKS**, 2σ | 1414 | 11.07% |
+  | **+ 3σ + κ₄ BLOCKS** | 3048 | **3.79%** ← *inside the ≤5% spec* |
+  | + 4σ + κ₄ blocks | 5562 | 4.16% |
+
+  Noise-deflated model error ≈ **2.6%**. **κ₄ blocks cut the per-step κ₃ error
+  2.7× (10.29 → 3.79) and break the floor that killed five architectures.**
+  Structure to note: at 2σ the κ₄ blocks barely help (13.58→11.07); they only
+  pay at 3σ — the same "families only work TOGETHER" pattern as E4. The 4th σ
+  edge is slightly HARMFUL. **⇒ the configuration is 3σ + κ₄ blocks.**
+
+  **⚠️ MY PRELIMINARY READ OF THIS WAS WRONG, AND THE REASON MATTERS.** The
+  N=4e5 smoke test showed 11.34% ("κ₄ blocks buy nothing") — an artifact of an
+  **8.62% truth-noise floor drowning a 3.8% signal.** Only the noise-floor check
+  (added after the G1b `k4_iiij` lesson) prevented writing off the correct route.
+  **Also: E9b's own 10.6% was measured at N=1e6 (noise floor ~5.5%) ⇒ its true
+  model error was ~9%. EVERY per-step number in this log needs noise deflation.**
+
+  **⚠️ EVIDENCE STATUS: 1 MLP, 1 layer — below this doc's own ≥24-MLP bar.**
+  In flight: layers 7/15 (κ₄ blocks should matter MORE at depth, where RMS skew
+  is 0.43 vs 0.10 at L3) and a multi-MLP repeat. Do not build on 3.79% until
+  those land.
+
+  **WHAT IT DOES AND DOES NOT BUY.** Per-step 3.79% still COMPOUNDS: √31·3.79%
+  ≈ **21% at L31**, while E6 wants ≤5% *accumulated*. **G2 is necessary but not
+  sufficient — G3 (anchoring) is still required**, and is now far more
+  attractive: the law gives √(0.038·0.30) ≈ **10.7%** at depth, ~7.5% with a
+  better anchor. For the first time all three legs have a measured path:
+  κ₄ slices learnable (G1c) → κ₄ blocks fix per-step κ₃ (G2) → anchoring fixes
+  the compounding (G3).
+
+- **2026-07-12 ⛔ G2 PRICING + ABLATION — THE PHYSICS IS PROVEN, THE PRICE IS NOT.**
+
+  **(1) The dense cost is absurd — priced BEFORE building, as §4.9.2 demands.**
+  | config | #diag | cost | per-step κ₃ err |
+  |---|---|---|---|
+  | star only (SHIPPED) | 3 | 1.2% of B | 69–93% |
+  | 3σ, no κ₄ | 156 | 61.6% of B | 10–13% |
+  | **3σ + κ₄ blocks (the G2 result)** | 3048 | **1203% of B** | 3.8–5.6% |
+
+  At the floor we can afford **~25** dense n³ diagrams per layer. **BUT the dense
+  n³ cost is the WRONG COST MODEL** (see (3)).
+
+  **(2) ⛔ ABLATION (L7, N=4e6) — the n³ operand is LOAD-BEARING:**
+  | κ₄ blocks kept | #diag | TENSOR err |
+  |---|---|---|
+  | NONE (baseline) | 156 | 13.14% |
+  | **n²-legs only** ((2,2,0),(3,1,0),(4,0,0)) — *what G1 learns* | 2388 | **13.95% — WORSE THAN NONE** |
+  | **(2,1,1) only** — *needs n³ κ₄_ppqr* | 816 | **4.69%** |
+  | ALL | 3048 | 4.50% |
+
+  **The κ₄ families G1 can supply are useless — actively harmful, the same
+  "partial κ₄ families are worse than none" signature as the whole κ₄ saga.
+  The entire win comes from the (2,1,1) block, i.e. from the n³ κ₄_ppqr.**
+  Silver lining: **816 diagrams give the whole win** (4.69 vs 4.50) — a free
+  3.7× prune.
+
+  **(3) ⭐ THE METRIC WAS WRONG — and this may reopen it (re-running).**
+  The ablation scores the FULL n³ TENSOR. But there are TWO consumers:
+  - **the MOMENT UPDATE consumes only the SLICE κ₃(a)_ppq.** On the (p,p,q)
+    plane, EVERY n³ operand collapses to n²: pass-through κ₃_pqr → κ₃(z)_ppq
+    (carried), and the (2,1,1) κ₄ operand → **κ₄_pppq / κ₄_ppqq — exactly the
+    n² slices G1 ALREADY LEARNS (28.5%)**. Slice cost = O(n²) per diagram ⇒
+    816 diagrams × n² × 32 layers ≈ **0.6% of budget.**
+  - **only TRANSPORT (carrying κ₃'s history) needs the full tensor**, and that
+    is what the factored/lazy-CP carry exists for (0.60% in the skeleton).
+  **⇒ Re-running the ablation with the SLICE metric. If the slice error is good
+  with n²-leg κ₄ (or with the (2,1,1) block restricted to the slice), the moment
+  update ships cheaply and only the carry is degraded — which is exactly what G3
+  anchoring is designed to repair.** This is the decision point of the project.
+
+  **(4) STILL OPEN — the oracle caveat that could kill G2 outright.** G2 fed the
+  blocks with **sampled (oracle) κ₄**. The real closure gets G1's learned slices
+  (ppqq 28.5%, pppq 50%, pppp 31%) and has NO learned ppqr at all. `--noise`
+  test queued: if the 2.7× evaporates at realistic κ₄ error, G2 is oracle-only.
+
+- **2026-07-12 ⭐ G3 — THE ANCHORING LAW (derived, numerically verified, and its
+  assumptions stress-tested BEFORE building).** `research/g3_anchor.py`.
+  The κ₃ problem is not the per-step error ε — it is that ε COMPOUNDS as √L
+  (ε≈8.5% → 47% at L31). Anchoring makes propagation a FILTER: each layer, blend
+  the carried κ₃ toward a HISTORY-FREE estimate (the E12 local map) whose error
+  does not compound. Fixed point, minimised over the blend weight α:
+      **α* = ε/a ,   e_depth = √(ε · a)   — the GEOMETRIC MEAN**, not √L·ε.
+  Verified by simulation (not hand algebra): predicted 0.160, simulated 0.172;
+  unanchored 0.478 ≈ √32·ε ✓. **The optimum is FLAT** (0.173 at α=0.2, 0.183 at
+  α=0.4) ⇒ α needs no tuning. At ε=8.5%, a=30%: **47% → ~17%.**
+  **⇒ e depends SYMMETRICALLY on ε and a ⇒ improving the ANCHOR (cheap, offline,
+  unlimited compute) is worth exactly as much as improving the DIAGRAMS (hard).**
+  This is the first lever in the project that gets EASIER with effort.
+  **Three risks identified before running (all now instrumented):**
+  1. **Independence is assumed.** The anchor reads the propagated state, so its
+     error correlates with the propagation's. Simulated: at ρ=0.5 anchoring still
+     gives 0.245; it dies only near ρ≈0.9. **ρ is now MEASURED in-loop.**
+  2. **Train/test state mismatch — the exact bug that broke the old oracle.**
+     The anchor is fit on TRUE (corpus) states but applied to DRIFTED ones. The
+     diagnostic pass reports the anchor's in-loop error vs E12's 27–34%; if it
+     degrades, refit on propagated states (DAgger).
+  3. **The anchor constrains n² of an n³ tensor.** Transport uses the full
+     tensor, so off-slice error still compounds. Fallback (`--mode gain`): E10
+     measured the tensor error to be mostly a MAGNITUDE bias (corr 0.97, gain →
+     1.88), so lift a STATE-PREDICTED gain from the slice to the whole tensor —
+     unlike E13's fixed scalar (which failed for exactly that reason).
+
+- **2026-07-12 (TOOLING — `research/fastmoments.py`, the sampling engine every
+  gate now shares).** The slice sampler was the compute wall (142 s/MLP; 24
+  MLPs ≈ 1 h), and it was a *device* bug, not a physics cost:
+  `e5_endtoend.true_slices` pulled every (chunk × 256) activation batch to the
+  **CPU and contracted it in float64** — 4 N·n² matmuls per layer per chunk,
+  ×32 layers, ×2 full passes ≈ 1.7e13 CPU float64 FLOPs per MLP, GPU idle.
+  Three fixes: (1) contract on MPS float32, accumulate (n,n) results in CPU
+  float64 (transfer drops from N·n to n·n; float32 sum error ~1e-4, three
+  orders under the slices' own noise floor); (2) **one cheap μ pass + one heavy
+  centred pass** instead of two heavy raw-moment passes — faster AND better
+  conditioned (no `k4 = m4 − 3m2²` cancellation); (3) **batch M MLPs through
+  bmm** (M=6 × 500k chunks ≈ 15 GB of the 128 GB unified memory).
+  A first cut was still **sync-bound at 69 s/MLP** (4 `.cpu()` calls × 32 layers
+  × 40 chunks ≈ 5k pipeline stalls/batch); keeping the accumulators **on-device
+  with a flush every 4 chunks** removed them.
+  **Validated for bias, not just speed** (`python fastmoments.py --validate`):
+  fast-vs-slow relative error equals the fast-vs-fast sampling-noise floor in
+  every cell (k4_iijj @L31: 4.42% vs 4.37%) ⇒ the paths differ only by their
+  random stream. Slices are disk-cached (`data/slice_cache/`) and reused by
+  every later gate.
+  - **⚠️ Finding that lands on G1: `k4_iiij` targets are 80% SAMPLING NOISE at
+    L1** (≈40% even at N=2e6). The 45% held-out error G1 reported for iiij was
+    substantially target noise, and it is the likely cause of the G1c smoke
+    test's all-learned cell (2.16e-6) being *worse* than its iijj-only cell
+    (1.03e-6): the regressor was fit against, and scored against, noise.
+    **Gates now run at N=8e6.** Any future slice-learning result must quote its
+    target-noise floor alongside it (G1b measures it).
+- **2026-07-12 (G1, kappa4-slice learnability — MARGINAL: ~25-28%, not ≤20%,
+  usable without propagation)** — `research/g1_k4_learn.py` (48 MLPs, 24
+  held-out, per-layer ridge, E12 design) + `research/g1b_target_noise.py`
+  (split-half corpus target noise, 2 MLPs).
+  - **Corpus target noise floors (N=2e6, measured at last):** zk3 0.7-5.9%
+    (mean 4.4%), zk4 2.1-11% (mean 6.0%) — small at depth. G1/E12 held-out
+    errors are MODEL error, not noise. E12's kappa3 verdict survives the
+    retro-audit (26.8% at L31 vs 0.7% noise).
+  - **Degree matters:** poly deg 6 overfits (cell C mean 40.1%); deg 4 is the
+    fair number (28.0%). All results below at deg 4, 48 MLPs.
+  - **kappa4_iijj held-out relative error (noise-deflated):** local-only ~39%;
+    + TRUE kappa3 slice features **~17% (L1) → 25-28% (L7-31), mean ~27%**;
+    + 25%-noisy kappa3 features: 33% (degrades gracefully). Unlike P1/E12
+    (star bought nothing), the history-bearing kappa3 features buy ~1.5-1.8×
+    at depth for kappa4 — the "history enters through kappa3" mechanism is
+    real for the next cumulant up.
+  - **Verdict vs the E6 spec (kappa4 ≤10-20%):** marginal miss. Interpolating
+    E6 (at kappa3 ≤2%): kappa4 @ ~27% → end-to-end ~1.2-1.6e-6 → score
+    ~1.2-1.6e-7 ≈ 2.2-2.8× better than v4, within ~1.5× of the leaders —
+    WITHOUT any kappa4 propagation (n² learned map at inference).
+  - **Headroom not yet used:** richer model class than ridge, more training
+    MLPs (offline unlimited), and diagram-derived features (the actual
+    kappa4-generation families instead of generic kappa3 products).
+  - **Standing caveat:** E6's tolerance used iid noise; regressor error is
+    structured. The decisive follow-up is G1c: plug PREDICTED kappa4 into the
+    complete-formula propagation (oracle kappa3 + learned kappa4) and measure
+    end-to-end — upgrades G1 from spec-table interpolation to measurement.
 - **2026-07-12 (later)** — E5a/E5b done with all four ledgers (ours-closure,
   v4, pluto, shiv, andrew) on the named public 50. **Router idea RETRACTED**
   (oracle routing to sampling: +0% for andrew, +2.5% pluto — their analytic
