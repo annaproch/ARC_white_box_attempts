@@ -25,21 +25,20 @@ DEV = "mps" if torch.backends.mps.is_available() else "cpu"
 N_W, DEPTH = 256, 32
 
 import sys
-sys.argv = ["x"]
 sys.path.insert(0, str(ROOT / "research"))
-import calibrate_k3k4 as K   # reuse the exact closure implementation
+import calibrate_k3k4 as K   # import is side-effect free (training lives in main())
 
 ck = torch.load(DATA / "calib_k3k4.pt", map_location=DEV)
 theta = ck["best_theta"].to(DEV)
-rank = ck.get("rank", 16)
+rank = int(ck.get("rank", 16))
+K.set_rank(rank)               # the closure must run at the rank it was trained at
 print(f"checkpoint: step {ck['step']}, best val {ck['best_val']:.3e}, rank {rank}")
 
 # ---- held-out MLPs (disjoint from training and from the val set used to pick theta)
 seeds = list(range(950_000, 950_000 + 16))
 Ws = K.make_ws(seeds)
 gt = K.mc_final(Ws, 2_000_000)
-pts = torch.tensor(np.load(DATA / "points_v3.npy") if (DATA / "points_v3.npy").exists()
-                   else np.load("/private/tmp/points_v3.npy"), device=DEV)
+pts = torch.tensor(np.load(DATA / "points_v3.npy"), device=DEV)
 
 est_c = K.closure(Ws, theta)
 x = pts.unsqueeze(0).expand(len(seeds), -1, -1).contiguous()

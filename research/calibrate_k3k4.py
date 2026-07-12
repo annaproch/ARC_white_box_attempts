@@ -49,22 +49,27 @@ DATA.mkdir(exist_ok=True)
 CKPT = DATA / "calib_k3k4.pt"
 VAL_CACHE = DATA / "val_gt_24.pt"
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--rank", type=int, default=16)
-ap.add_argument("--batch-mlps", type=int, default=8)
-# the MC target is an UNBIASED gradient signal at any batch size, so a small
-# x-batch just adds gradient noise -- and it dominates step cost. 2048 is ~4x
-# cheaper per step than 8192 and lets us take many more steps.
-ap.add_argument("--x-batch", type=int, default=2048)
-ap.add_argument("--steps", type=int, default=100_000)
-ap.add_argument("--eval-every", type=int, default=50)
-ap.add_argument("--lr", type=float, default=3e-3)
-ap.add_argument("--val-mlps", type=int, default=24)
-ap.add_argument("--val-samples", type=int, default=2_000_000)
-ap.add_argument("--export", action="store_true", help="export best params and exit")
-ap.add_argument("--fresh", action="store_true", help="ignore checkpoint")
-args = ap.parse_args()
-R = args.rank
+def _parse():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument("--batch-mlps", type=int, default=8)
+    # the MC target is an UNBIASED gradient signal at any batch size, so a small
+    # x-batch just adds gradient noise -- and it dominates step cost. 2048 is ~4x
+    # cheaper per step than 8192 and lets us take many more steps.
+    ap.add_argument("--x-batch", type=int, default=2048)
+    ap.add_argument("--steps", type=int, default=100_000)
+    ap.add_argument("--eval-every", type=int, default=50)
+    ap.add_argument("--lr", type=float, default=3e-3)
+    ap.add_argument("--val-mlps", type=int, default=24)
+    ap.add_argument("--val-samples", type=int, default=2_000_000)
+    ap.add_argument("--export", action="store_true", help="export best params and exit")
+    ap.add_argument("--fresh", action="store_true", help="ignore checkpoint")
+    return ap.parse_args()
+
+
+# Module-level rank so the closure can be imported and reused (export_closure.py).
+# Call set_rank() to match a checkpoint before calling closure().
+R = 16
 
 # 13 params/layer: [p, q, moff, s_dia, s_off, c3m, c3c, c3g, c3p, c4m, c4c, c4g, c4p]
 NP = 13
@@ -114,6 +119,13 @@ def mc_final(Ws, n_samples, chunk=16384):
 
 
 _Q0 = torch.randn(N_W, R, generator=torch.Generator().manual_seed(7)).to(DEV)
+
+
+def set_rank(r):
+    """Set the Tucker rank (and reseed the subspace-iteration start block)."""
+    global R, _Q0
+    R = int(r)
+    _Q0 = torch.randn(N_W, R, generator=torch.Generator().manual_seed(7)).to(DEV)
 
 
 def _qr(Y):
@@ -261,90 +273,98 @@ def closure(Ws, theta):
     raise RuntimeError
 
 
-# ---------------- validation ground truth (cached) ----------------
-if VAL_CACHE.exists():
-    blob = torch.load(VAL_CACHE)
-    val_seeds, val_gt = blob["seeds"], blob["gt"].to(DEV)
-else:
-    val_seeds = list(range(80_000, 80_000 + args.val_mlps))
+def load_val(n_mlps=24, n_samples=2_000_000):
+    """Cached validation ground truth."""
+    if VAL_CACHE.exists():
+        blob = torch.load(VAL_CACHE)
+        return blob["seeds"], blob["gt"].to(DEV)
+    seeds = list(range(80_000, 80_000 + n_mlps))
     t0 = time.time()
-    val_gt = mc_final(make_ws(val_seeds), args.val_samples)
-    torch.save({"seeds": val_seeds, "gt": val_gt.cpu(), "n_samples": args.val_samples},
-               VAL_CACHE)
+    gt = mc_final(make_ws(seeds), n_samples)
+    torch.save({"seeds": seeds, "gt": gt.cpu(), "n_samples": n_samples}, VAL_CACHE)
     print(f"built validation GT in {time.time()-t0:.0f}s")
-WV = make_ws(val_seeds)
+    return seeds, gt
 
 
-@torch.no_grad()
-def val_mse(theta):
-    tot, bs = 0.0, 8
-    for i in range(0, len(val_seeds), bs):
-        est = closure(WV[i:i + bs], theta)
-        tot += float(((est - val_gt[i:i + bs]) ** 2).sum())
-    return tot / (len(val_seeds) * N_W)
+def main():
+    args = _parse()
+    set_rank(args.rank)
+
+    val_seeds, val_gt = load_val(args.val_mlps, args.val_samples)
+    WV = make_ws(val_seeds)
+
+    @torch.no_grad()
+    def val_mse(theta):
+        tot, bs = 0.0, 8
+        for i in range(0, len(val_seeds), bs):
+            est = closure(WV[i:i + bs], theta)
+            tot += float(((est - val_gt[i:i + bs]) ** 2).sum())
+        return tot / (len(val_seeds) * N_W)
+
+    theta = torch.zeros(DEPTH, NP, device=DEV, requires_grad=True)
+    opt = torch.optim.Adam([theta], lr=args.lr)
+    start_step, best = 1, (float("inf"), theta.detach().clone())
+    if CKPT.exists() and not args.fresh:
+        st = torch.load(CKPT, map_location=DEV)
+        if st.get("rank", R) != R:
+            print(f"checkpoint rank {st.get('rank')} != --rank {R}; use --fresh or match it")
+            raise SystemExit(1)
+        with torch.no_grad():
+            theta.copy_(st["theta"])
+        opt.load_state_dict(st["opt"])
+        start_step = st["step"] + 1
+        best = (st["best_val"], st["best_theta"].to(DEV))
+        print(f"resumed from step {st['step']} (best val {st['best_val']:.3e})")
+
+    if args.export:
+        out = DATA / "theta_k3k4_best.pt"
+        torch.save({"theta": best[1].cpu(), "rank": R, "val": best[0]}, out)
+        print(f"exported best params (val {best[0]:.3e}) -> {out}")
+        return
+
+    base = val_mse(torch.zeros(DEPTH, NP, device=DEV))
+    print(f"uncalibrated closure (theta=0): {base:.3e}   [K=2 ~1.3e-4, v4 raw 3.1e-6]")
+    if best[0] == float("inf"):
+        best = (base, theta.detach().clone())
+
+    stop = {"flag": False}
+    signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
+
+    def save(step):
+        torch.save({"theta": theta.detach().cpu(), "opt": opt.state_dict(), "step": step,
+                    "best_val": best[0], "best_theta": best[1].cpu(), "rank": R}, CKPT)
+
+    print("training (Ctrl-C to stop; progress is checkpointed every eval)\n")
+    t0 = time.time()
+    for step in range(start_step, args.steps + 1):
+        seeds = torch.randint(3_000_000, 9_000_000, (args.batch_mlps,)).tolist()
+        Ws = make_ws(seeds)
+        with torch.no_grad():
+            target = mc_final(Ws, args.x_batch)
+        est = closure(Ws, theta)
+        loss = ((est * est).sum(1) - 2 * (est * target).sum(1)).mean()
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([theta], 1.0)
+        opt.step()
+
+        if step % args.eval_every == 0 or stop["flag"]:
+            v = val_mse(theta.detach())
+            if v < best[0]:
+                best = (v, theta.detach().clone())
+            save(step)
+            rate = step / max(time.time() - t0, 1e-9)
+            print(f"step {step:6d}  val {v:.3e}  best {best[0]:.3e}  "
+                  f"({rate:.1f} steps/s)  [checkpointed]")
+        if stop["flag"]:
+            print("\nstopped; state saved. Re-run to resume, "
+                  "or run research/export_closure.py to ship the best params.")
+            break
+
+    print(f"\nbest val MSE {best[0]:.3e}  (uncalibrated {base:.3e}, "
+          f"gain {base/max(best[0],1e-30):.2f}x)")
+    print("v4 raw MSE 3.1e-6 -> beat that and pure-analytic at the floor wins.")
 
 
-# ---------------- state (resumable) ----------------
-theta = torch.zeros(DEPTH, NP, device=DEV, requires_grad=True)
-opt = torch.optim.Adam([theta], lr=args.lr)
-start_step, best = 1, (float("inf"), theta.detach().clone())
-if CKPT.exists() and not args.fresh:
-    st = torch.load(CKPT, map_location=DEV)
-    with torch.no_grad():
-        theta.copy_(st["theta"])
-    opt.load_state_dict(st["opt"])
-    start_step = st["step"] + 1
-    best = (st["best_val"], st["best_theta"].to(DEV))
-    print(f"resumed from step {st['step']} (best val {st['best_val']:.3e})")
-
-if args.export:
-    th = best[1].cpu()
-    out = DATA / "theta_k3k4_best.pt"
-    torch.save({"theta": th, "rank": R, "val": best[0]}, out)
-    print(f"exported best params (val {best[0]:.3e}) -> {out}")
-    raise SystemExit
-
-base = val_mse(torch.zeros(DEPTH, NP, device=DEV))
-print(f"uncalibrated closure (theta=0): {base:.3e}   [K=2 ~1.3e-4, v4 raw 3.1e-6]")
-if best[0] == float("inf"):
-    best = (base, theta.detach().clone())
-
-stop = {"flag": False}
-signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
-
-
-def save(step):
-    torch.save({"theta": theta.detach().cpu(), "opt": opt.state_dict(), "step": step,
-                "best_val": best[0], "best_theta": best[1].cpu(), "rank": R}, CKPT)
-
-
-print("training (Ctrl-C to stop; progress is checkpointed every eval)\n")
-t0 = time.time()
-for step in range(start_step, args.steps + 1):
-    seeds = torch.randint(3_000_000, 9_000_000, (args.batch_mlps,)).tolist()
-    Ws = make_ws(seeds)
-    with torch.no_grad():
-        target = mc_final(Ws, args.x_batch)
-    est = closure(Ws, theta)
-    loss = ((est * est).sum(1) - 2 * (est * target).sum(1)).mean()
-    opt.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_([theta], 1.0)
-    opt.step()
-
-    if step % args.eval_every == 0 or stop["flag"]:
-        v = val_mse(theta.detach())
-        if v < best[0]:
-            best = (v, theta.detach().clone())
-        save(step)
-        r = step / max(time.time() - t0, 1e-9)
-        print(f"step {step:6d}  val {v:.3e}  best {best[0]:.3e}  "
-              f"({r:.1f} steps/s)  [checkpointed]")
-    if stop["flag"]:
-        print("\nstopped by user; state saved. Re-run to resume, "
-              "or add --export to write the best params.")
-        break
-
-print(f"\nbest val MSE {best[0]:.3e}  (uncalibrated {base:.3e}, "
-      f"gain {base/max(best[0],1e-30):.2f}x)")
-print("v4 raw MSE 3.1e-6 -> beat that and a pure-analytic estimator at the floor wins.")
+if __name__ == "__main__":
+    main()
