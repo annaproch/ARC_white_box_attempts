@@ -18,7 +18,35 @@ import flopscope as flops
 import flopscope.numpy as fnp
 from whestbench import MLP, BaseEstimator
 
+import closure
+
+
+def _closure_flops(n: int, depth: int, r: int) -> float:
+    """Analytic FLOP estimate for the K=2+kappa3+kappa4 closure, used to reserve
+    budget before sizing the QMC batch. Dominated by the O(n^3) covariance and
+    star matmuls; the Tucker cores add O(n^2 r + n r^4 + r^5)."""
+    per_layer = 6.0 * n ** 3 + 4.0 * n * n * r + 2.0 * n * r ** 4 + 2.0 * r ** 5
+    return depth * per_layer
+
 POINTS_FILE = "points.npz"
+CLOSURE_FILE = "closure.npz"
+
+
+class ClosureParams(flopscope.Module):
+    """Calibrated coefficients for the analytic K=2 + kappa3 + kappa4 closure
+    (produced by `research/calibrate_k3k4.py --export`). Offline => 0-FLOP load.
+
+    theta : (depth, 13) per-layer coefficients
+    meta  : [rank, w_fuse]
+            w_fuse = weight on the closure when fusing with QMC at the final
+            layer. 0 => pure QMC (exactly v4's behaviour); 1 => pure analytic.
+            Set offline from held-out MLPs, so a weak closure cannot regress us.
+    """
+
+    def __init__(self) -> None:
+        self.theta = fnp.zeros((1, 1))
+        self.meta = fnp.zeros((2,))
+
 
 # Per-layer closure corrections (p, q, v, g1, g2, m) for calibrated K=2
 # covariance propagation, learned offline end-to-end (fresh random MLP per
@@ -103,29 +131,56 @@ class Estimator(BaseEstimator):
     def __init__(self) -> None:
         self._setup_rng = None  # set from ctx.seed inside setup()
         self._points = None
+        self._theta = None      # (depth, 13) calibrated closure coefficients
+        self._rank = 0
+        self._w_fuse = 0.0      # 0 => pure QMC (v4 behaviour); set offline
 
     def setup(self, ctx) -> None:
         self._setup_rng = fnp.random.default_rng(ctx.seed)
-        if getattr(ctx, "submission_dir", None) is not None:
-            # str, not Path: the grader's flopscope-client requires a string.
-            path = Path(ctx.submission_dir) / POINTS_FILE
-            if path.exists():
-                self._points = Points.from_file(str(path)).x
+        if getattr(ctx, "submission_dir", None) is None:
+            return
+        # str, not Path: the grader's flopscope-client requires a string.
+        d = Path(ctx.submission_dir)
+        if (d / POINTS_FILE).exists():
+            self._points = Points.from_file(str(d / POINTS_FILE)).x
+        if (d / CLOSURE_FILE).exists():
+            cp = ClosureParams.from_file(str(d / CLOSURE_FILE))
+            meta = fnp.asarray(cp.meta)
+            w = float(meta[1])
+            if w > 0.0:                       # a zero weight means "don't run it"
+                self._theta = cp.theta
+                self._rank = int(float(meta[0]))
+                self._w_fuse = w
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         width, depth = mlp.width, mlp.depth
+
+        # The analytic closure (K=2 + kappa3 + kappa4) is the accuracy engine; QMC
+        # is the variance-limited safety net. w_fuse is fitted offline on held-out
+        # MLPs, so a weak closure simply gets a small weight and cannot regress us.
+        # Budget is allocated to QMC *after* reserving the closure's cost.
+        analytic = None
+        if self._theta is not None:
+            analytic = closure.predict_final_mean(mlp, self._theta, self._rank)
+            if analytic is not None:
+                chk = fnp.asarray(analytic, dtype=fnp.float64)
+                if not bool(fnp.all(fnp.isfinite(chk))) or float(fnp.max(fnp.abs(chk))) > 10.0:
+                    analytic = None            # never ship a diverged closure
+
+        w_a = self._w_fuse if analytic is not None else 0.0
         # Per-sample cost: matmul (2n^2) + relu (n) + mean accumulation (n) per layer.
         flops_per_sample = depth * (2 * width * width + 2 * width)
+        closure_flops = _closure_flops(width, depth, self._rank) if analytic is not None else 0
+        sample_budget = max(self._BUDGET_FRACTION * budget - closure_flops, 0.0)
 
         pts = self._points
         if pts is not None and pts.shape[1] == width:
-            n = max(min(int(self._BUDGET_FRACTION * budget / flops_per_sample),
-                        pts.shape[0]), 1)
+            n = max(min(int(sample_budget / flops_per_sample), pts.shape[0]), 1)
             x = pts[:n]
         else:
             # Fallback for shapes the shipped points don't cover (+16 FLOPs/elem RNG).
             rng = fnp.random.default_rng(mlp.seed)
-            n = max(int(self._BUDGET_FRACTION * budget / (flops_per_sample + 16 * width)), 1)
+            n = max(int(sample_budget / (flops_per_sample + 16 * width)), 1)
             x = rng.standard_normal((n, width)).astype(fnp.float32)
 
         rows = []
@@ -133,9 +188,12 @@ class Estimator(BaseEstimator):
             x = fnp.maximum(fnp.matmul(x, w), 0.0)
             rows.append(fnp.mean(x, axis=0))
 
-        # Fuse the (only scored) final layer with calibrated K=2 covariance
-        # propagation when the shipped calibration matches this shape.
-        if depth == len(_THETA) and pts is not None and pts.shape[1] == width:
+        if w_a >= 1.0:                          # pure analytic
+            rows[-1] = analytic
+        elif w_a > 0.0:                         # fuse the (only scored) final layer
+            rows[-1] = (1.0 - w_a) * rows[-1] + w_a * analytic
+        elif depth == len(_THETA) and pts is not None and pts.shape[1] == width:
+            # v4 fallback: fuse with the older calibrated-K2 closure.
             k2 = self._calibrated_k2_final(mlp)
             k2_np = fnp.asarray(k2, dtype=fnp.float64)
             if bool(fnp.all(fnp.isfinite(k2_np))) and float(fnp.max(fnp.abs(k2_np))) < 10.0:
