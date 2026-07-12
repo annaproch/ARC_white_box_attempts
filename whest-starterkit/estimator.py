@@ -48,6 +48,7 @@ class ClosureParams(flopscope.Module):
     def __init__(self) -> None:
         self.theta = fnp.zeros((1, 1))
         self.meta = fnp.zeros((2,))
+        self.q0 = fnp.zeros((1, 1))     # subspace-iteration start block (shipped)
 
 
 # Per-layer closure corrections (p, q, v, g1, g2, m) for calibrated K=2
@@ -136,6 +137,7 @@ class Estimator(BaseEstimator):
         self._theta = None      # (depth, 13) calibrated K3/K4 closure coefficients
         self._rank = 0
         self._rank4 = 8
+        self._q0 = None
         self._n_pts = 0         # QMC points to use alongside the closure
         self._w = None          # 3-way fusion weights [QMC, K2, K3K4], sum = 1
 
@@ -158,6 +160,7 @@ class Estimator(BaseEstimator):
                 self._n_pts = int(float(meta[1]))
                 self._w = [float(meta[2]), float(meta[3]), float(meta[4])]
                 self._rank4 = int(float(meta[5])) if meta.shape[0] >= 6 else 8
+                self._q0 = cp.q0
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         width, depth = mlp.width, mlp.depth
@@ -172,7 +175,7 @@ class Estimator(BaseEstimator):
         analytic = None
         if self._theta is not None and shape_ok:
             analytic = closure.predict_final_mean(mlp, self._theta, self._rank,
-                                                  self._rank4)
+                                                  self._rank4, self._q0)
             if analytic is not None:
                 chk = fnp.asarray(analytic, dtype=fnp.float64)
                 if not bool(fnp.all(fnp.isfinite(chk))) or float(fnp.max(fnp.abs(chk))) > 10.0:

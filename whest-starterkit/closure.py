@@ -84,7 +84,7 @@ def _wick_cov(a, pdf, cdf, s, rho):
     return fnp.outer(s, s) * acc
 
 
-def predict_final_mean(mlp, theta, rank, rank4=8):
+def predict_final_mean(mlp, theta, rank, rank4, q0):
     """Final-layer mean via the calibrated K=2 + kappa3 + kappa4 closure.
 
     theta: (depth, 13) array of calibrated coefficients (zeros => uncalibrated).
@@ -101,7 +101,7 @@ def predict_final_mean(mlp, theta, rank, rank4=8):
     W0 = mlp.weights[0]
     m = fnp.zeros(n, dtype=fnp.float32)
     S = fnp.matmul(W0.T, W0)                      # z_0 = W0^T x,  x ~ N(0, I)
-    V = _top_basis(S, r)
+    V = _top_basis(S, q0)
     T3 = fnp.zeros((r, r, r), dtype=fnp.float32)
     T4 = fnp.zeros((r4, r4, r4, r4), dtype=fnp.float32)  # kappa4: smaller rank
     # kappa4's core costs O(n r^4): at r=32 it alone is 8.4% of budget, which
@@ -170,7 +170,7 @@ def predict_final_mean(mlp, theta, rank, rank4=8):
         S_pre = S
         m = fnp.matmul(mu_a, W)
         S = fnp.matmul(W.T, fnp.matmul(Sig, W))
-        V_next = _top_basis(S, r)
+        V_next = _top_basis(S, q0)
 
         Z = h1[:, None] * fnp.matmul(W, V_next)
         M = fnp.matmul(Z.T, V)

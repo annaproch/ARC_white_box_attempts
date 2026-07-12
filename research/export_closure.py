@@ -163,6 +163,9 @@ if s_best < s_v4 * 0.995:
              theta=theta.cpu().numpy().astype(np.float32),
              meta=np.array([float(rank), float(n_best),
                             w3[0], w3[1], w3[2], float(rank4)], dtype=np.float32),
+             # ship the subspace-iteration start block so the estimator builds the
+             # SAME basis the coefficients were calibrated on
+             q0=K._Q0.cpu().numpy().astype(np.float32),
              **{"__meta__": np.frombuffer(b"{}", dtype=np.uint8)})
     print(f"wrote {KIT/'closure.npz'} (r3 {rank}, r4 {rank4}, pts {n_best}, "
           f"w[qmc,k2,closure] = {[round(v,3) for v in w3]})")
