@@ -177,6 +177,19 @@ class Estimator(BaseEstimator):
         have_pts = pts is not None and pts.shape[1] == width
         shape_ok = depth == len(_THETA) and have_pts
 
+        # PURE-ANALYTIC mode: w_qmc == 0 => no sampling at all. The closure
+        # already computes mu at every layer, so it fills all rows on its own.
+        if (self._theta is not None and self._w is not None
+                and abs(self._w[0]) < 1e-6 and depth == self._theta.shape[0]):
+            out = closure.predict_all_layers(mlp, self._theta, self._rank,
+                                             self._rank4, self._q0)
+            if out is not None:
+                chk = fnp.asarray(out, dtype=fnp.float64)
+                if (bool(fnp.all(fnp.isfinite(chk)))
+                        and float(fnp.max(fnp.abs(chk))) < 10.0):
+                    return out
+            # fall through to the sampling path if the closure misbehaved
+
         # Three-way fusion when calibrated params shipped: QMC + calibrated-K2 +
         # the K3/K4 closure. Weights and the QMC point count are fitted offline on
         # held-out MLPs against the SCORE (accuracy x compute), and the file is

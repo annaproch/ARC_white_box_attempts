@@ -100,11 +100,19 @@ def _wick_cov(a, pdf, cdf, s, rho):
     return fnp.outer(s, s) * acc
 
 
-def predict_final_mean(mlp, theta, rank, rank4, q0):
+def predict_all_layers(mlp, theta, rank, rank4, q0):
+    """All-layer means (depth, width) via the closure -- for a PURE-ANALYTIC
+    estimator (no sampling at all). The closure already computes mu at every
+    layer; returning them costs nothing extra."""
+    return predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=True)
+
+
+def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False):
     """Final-layer mean via the calibrated K=2 + kappa3 + kappa4 closure.
 
     theta: (depth, 13) array of calibrated coefficients (zeros => uncalibrated).
-    Returns (width,) or None if the shape is not covered by these params.
+    Returns (width,) -- or (depth, width) if all_layers -- or None if the shape
+    is not covered by these params.
     """
     n = mlp.width
     depth = mlp.depth
@@ -123,6 +131,7 @@ def predict_final_mean(mlp, theta, rank, rank4, q0):
     # kappa4's core costs O(n r^4): at r=32 it alone is 8.4% of budget, which
     # doubles the score multiplier. kappa4 is ~rank-1 at depth, so r4 << r.
     star = None                                   # (h2, h3, Wr, Bs) in z_l space
+    rows = []
 
     for li in range(depth):
         c = _coeffs(theta[li])
@@ -178,8 +187,10 @@ def predict_final_mean(mlp, theta, rank, rank4, q0):
         Sig = Sig + c["c4c"] * 0.25 * (pdf[:, None] * pdf[None, :] * q4)
         Sig = Sig * (1.0 - eye) + fnp.diag(var_a)
 
+        if all_layers:
+            rows.append(mu_a)
         if li == depth - 1:
-            return mu_a
+            return fnp.stack(rows, axis=0) if all_layers else mu_a
 
         # ---- push through the next linear layer
         W = mlp.weights[li + 1]

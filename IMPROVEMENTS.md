@@ -261,6 +261,120 @@ inconsistent, which is worse than K=2's self-cancelling fixed point. Propagate
 consistently and the L31 row projects a final-layer error of **~5e-8 — below
 the competitor's 3.2e-7.**
 
+---
+
+# ROUND 8 — THE CLOSURE SHIPS, AND WHAT IT COST US TO LEARN
+
+## Leaderboard state
+
+| version | public score | method |
+|---|---|---|
+| **v4 (best, on the board)** | **3.396e-7** | QMC(6400) + calibrated-K2, fused |
+| leader | 9.16e-8 | pure analytic, 26% budget |
+| top-10 rival | 3.24e-8 (per-MLP) | pure analytic, 8.5% budget, 21 s wall |
+
+## Two configurations measured on the grader (mini split, 100 MLPs)
+
+| estimator | raw MSE | utilisation | multiplier | **score** |
+|---|---|---|---|---|
+| v4 | 3.66e-6 | 10.9% | 0.109 | **3.66e-7** |
+| 3-way (QMC5200 + K2 + closure) | 3.69e-6 | **12.8%** | 0.128 | **4.74e-7** ❌ |
+| **pure analytic (closure only)** | 1.19e-5 | **4.95%** | 0.101 | **1.22e-6** |
+
+Both closure runs: **0/100 failed** — the flopscope port works.
+
+## The FLOP-model disaster (and the lesson)
+
+The 3-way *improved accuracy* (3.69e-6 vs v4's 3.66e-6 at fewer QMC points, and
+the held-out fit gave the closure a fusion weight of 0.31 while dropping K2
+entirely) — but it **lost on score**, because my analytic FLOP estimate was
+**2.7× too low**:
+
+| | estimated | measured |
+|---|---|---|
+| closure cost | 4.16e9 (1.5%) | **1.13e10 (4.2%)** |
+
+I counted the Tucker cores and forgot the matmuls that dominate: the **star
+slice alone is four 2n³ matmuls** (`C3ᵀBs`, `D3ᵀWr`, plus two for κ₄), on top of
+the covariance propagation (4n³) and the star's `B` matrix (2n³) — **~14n³ per
+layer, not 6**. Residual wall time was fine (17 ms/MLP, 0.6%).
+
+**Rule adopted: never trust an analytic FLOP estimate — measure it with
+`whest run` before believing any sweep.** The export now uses measured costs and
+warns loudly when extrapolating.
+
+## THE INSIGHT THAT REFRAMES EVERYTHING
+
+**Pure analytic uses only 4.95% of budget.** The multiplier floors at 10%, so a
+sampling-free estimator has **~5% of budget sitting completely idle** — compute
+is *free* until the floor.
+
+That inverts the whole optimisation problem. For weeks (hours) I was shaving
+FLOPs off the closure to fit it alongside QMC. In pure-analytic mode we should be
+doing the **opposite**: spend the idle 5% on accuracy.
+
+- κ₃ rank 32 → 64+ (cost O(n·r³), we can afford it)
+- **κ₄ chain diagrams** (see below)
+- more subspace-iteration passes, more Wick terms
+
+Every one of these is blocked by *accuracy*, not budget — and we have budget to
+burn. **Accuracy is now the only currency.**
+
+## Why κ₄ has been useless (diagnosed)
+
+Count Σ-edges per diagram — that is the order in the small parameter:
+
+- **κ₃**: star = 2 edges, triangle = 3 → star dominates. Measured: star-only gives
+  corr 0.996 at L1, and the triangle adds nothing. ✓
+- **κ₄**: star = 3 edges, **chain = 3 edges** → *same order*. I implemented only
+  the star, so we have been computing roughly **half** of κ₄'s leading generation.
+
+This is why every κ₄ configuration measured the same: uncalibrated 3.13e-5
+(r₄=8) vs **2.47e-5 (r₄=1, i.e. κ₄ mostly off)** — removing κ₄ made the closure
+*better* — and calibrated val was identical (1.053e-5 vs 1.066e-5). The
+calibration simply learns to switch κ₄ off.
+
+The chain's slice is cheap once derived: with `P = diag(h₁)W`, `Q = diag(h₂)W`,
+`R = Σ·P`, `U = Q ∘ R`, it collapses to `(Uᵀ Σ U)_pq` — two n³ matmuls.
+
+## Two flopscope traps (cost us a failed submission)
+
+1. **einsum infers symmetry from repeated operands.** `einsum("i,im,ik,il->mkl",
+   h2, A, Bv, Bv)` sees the repeated `Bv` and tags the output symmetric across
+   ALL axes, then validates and rejects — but an individual star term is symmetric
+   only in (k,l); *only the sum of the three* is fully symmetric. Error surfaces as
+   `Tensor not symmetric along axes (0,1,2): max deviation = inf`, which killed
+   100/100 MLPs. **Fix: build these contractions with matmul + reshape, which
+   carries no symmetry inference.** Same math, same FLOPs.
+2. **flopscope has `linalg.qr` and `linalg.eigh`** — use them. My first port
+   hand-rolled Gram-Schmidt in a Python loop (~32k tiny ops/MLP), which would have
+   been a residual-wall-time disaster at λ = 1e11 FLOPs/s.
+
+## A retraction (mine)
+
+I "fixed" the star symmetrisation, claiming the permutes put the A-factor in slot
+1 twice. **That was wrong** — I misread torch's `permute` semantics;
+`U3.permute(0,2,3,1)[b,m,k,l] = U3[b,l,m,k]` *is* the slot-2 term. The permutes
+were correct and my fix was a no-op (which is why the uncalibrated value came back
+bit-identical). The real bug was flopscope's symmetry inference, above.
+
+## THE PLAN: layerwise fitting (`fit_layerwise.py`)
+
+Every end-to-end configuration plateaus at **~1.05e-5** (r=16, r=32/r₄=32,
+r=32/r₄=8 — all the same), which is a *structural* limit, not a capacity one.
+Cause: each layer's coefficients get their gradient from ONE distant loss (256
+numbers, backpropagated through 32 layers).
+
+The corpus (now 64 MLPs) has the TRUE μ, Σ, κ₃, κ₄ at **every layer**, so:
+
+- **(A) Moment corrections are LINEAR in the coefficients** → closed-form least
+  squares, per layer, with the true cumulants injected. No SGD at all. The
+  *residual* of each fit says exactly what the correction form cannot express.
+- **(B) Cumulant propagation** — the actual bottleneck — gets supervised directly
+  against sampled κ₃/κ₄ (32 × 65k targets per MLP instead of 256), with the κ₄
+  **chain diagram** fitted from a candidate dictionary rather than derived by hand
+  (given today's track record, that is risk management, not humility).
+
 ## 📊 HONEST SCORECARD (as of the κ₃ closure, before κ₄ + calibration)
 
 **Leaderboard reality:**
