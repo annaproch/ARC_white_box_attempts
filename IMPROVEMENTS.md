@@ -167,6 +167,47 @@ by the data (the top eigenvector).
 If it lands: layer the existing end-to-end calibration on top, drop sampling
 entirely, and port to flopscope.
 
+**Rank-1 core: TESTED, 1.06× — rejected.** With a stable particle
+representation the recursion is healthy (λ₁ = 1.81 at L31, inside the true
+1.5–2.5 range), but the gain is nil. Reason, visible in the drift table: the
+λ₁ error accumulates over **layers 2–11, where eig1frac is only 0.03–0.27** —
+the covariance is *not* rank-1 dominated where the error is actually made. The
+top mode only dominates at the very end. Rank-1 is the wrong sketch.
+(Also note: if c were Gaussian this closure is *identical* to K=2 — all its
+value depends on the core's non-Gaussianity, and one mode isn't enough.)
+
+**Scalar calibration is exhausted.** Widening the per-layer correction bounds
+from ±5% to ±60% (the measured bias is −27…−43%) plateaus at **2.6e-5** —
+statistically the same as the ±5% version's 2.4e-5. Two very different
+parametrizations hitting the same wall means this is a *shape* limitation, not
+an optimization one: the κ₃ correction
+`ΔCov_ij ∝ g₂(i)g₁(j)·κ₃(i,i,j) + g₁(i)g₂(j)·κ₃(i,j,j)`
+is **not proportional to Σ_ij**, so no uniform scaling can reproduce it.
+
+## THE ORACLE TEST (prices the whole third/fourth-order program)
+
+Key structural fact: **the closure only ever needs CONTRACTED cumulants** —
+κ₃(i,i,j) and κ₄(i,i,j,j), which are **n² objects**, not n³/n⁴ tensors. They
+are directly sampleable with one extra n×n matmul per batch
+(`(a²)ᵀa`, `(a²)ᵀ(a²)`).
+
+So `build_moment_corpus.py` caches, per MLP and per layer: μ, Σ, κ₃_iij,
+κ₄_iijj (~25 MB/MLP). Then `oracle_cumulants.py` injects the **true** slices
+into the covariance update and measures the final-layer MSE — the ceiling of
+the entire κ₃/κ₄ program, obtained *before* building any propagator:
+
+- **K2 + true κ₃ ≈ 1e-6** → third cumulants are the answer; then either build
+  the rank-r κ₃ propagator, or (much cheaper) **learn the κ₃ slices from the
+  K=2 state** (α_i, α_j, ρ_ij, layer) — n² cost, no tensor propagation at all.
+- **needs κ₄ too** → add the fourth-order term.
+- **even oracle-Σ (true Σ at every layer) is ≫ 1e-6** → the covariance is not
+  the whole story and the mean path matters.
+
+The corpus is also the substrate for **supervised layerwise training** (match
+the true Σ at every layer: 32 × 65k targets per MLP, versus the 256 numbers of
+final-layer MSE we have been squeezing gradients from — the likely cause of
+every plateau so far).
+
 ## The plan
 
 1. **[done] Error attribution at the final ReLU** (`error_attribution.py`).
