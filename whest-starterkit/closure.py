@@ -84,13 +84,17 @@ def _mode_contract(T, M, ndim, r):
     Matmul + reshape/transpose only (both free of symmetry inference; reshapes and
     transposes are 0-FLOP in flopscope). einsum would tag the result symmetric from
     the repeated M operands and then reject it.
+
+    CYCLIC layout: contract the FRONT mode, then rotate it to the back -- after
+    ndim rotations every mode has been contracted once and the axis order is back
+    to the original. Same matmuls in the same order as the old moveaxis(axis,0)/
+    moveaxis(0,axis) version, but 4 ops per mode instead of 5 (one rotation
+    replaces the bring-to-front + put-back pair). ~7 fewer op launches per layer
+    across T3+T4 => less flopscope overhead + residual wall time.
     """
-    for axis in range(ndim):
-        T = fnp.moveaxis(T, axis, 0)                    # bring this mode to front
-        T = fnp.reshape(T, (r, -1))
-        T = fnp.matmul(M, T)                            # contract it
-        T = fnp.reshape(T, (r,) * ndim)
-        T = fnp.moveaxis(T, 0, axis)                    # put it back
+    for _ in range(ndim):
+        T = fnp.reshape(fnp.matmul(M, fnp.reshape(T, (r, -1))), (r,) * ndim)
+        T = fnp.moveaxis(T, 0, ndim - 1)                # rotate: next mode to front
     return T
 
 
@@ -113,12 +117,13 @@ def _wick_cov(a, pdf, cdf, s, rho):
     return fnp.outer(s, s) * acc
 
 
-def predict_all_layers(mlp, theta, rank, rank4, q0, no_k4=False, anchor=None):
+def predict_all_layers(mlp, theta, rank, rank4, q0, no_k4=False, anchor=None,
+                       coeffs=None):
     """All-layer means (depth, width) via the closure -- for a PURE-ANALYTIC
     estimator (no sampling at all). The closure already computes mu at every
     layer; returning them costs nothing extra."""
     return predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=True,
-                             no_k4=no_k4, anchor=anchor)
+                             no_k4=no_k4, anchor=anchor, coeffs=coeffs)
 
 
 # --- ANCHOR (A1): per-layer polynomial correction of the kappa3 slice.
@@ -154,10 +159,19 @@ def _anchor_feats(t, rho, prop_n, star_n, n):
 
 
 def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=False,
-                       anchor=None):
+                       anchor=None, coeffs=None):
     """Final-layer mean via the calibrated K=2 + kappa3 + kappa4 closure.
 
     theta: (depth, 13) array of calibrated coefficients (zeros => uncalibrated).
+    coeffs: OPTIONAL list of depth dicts of plain-Python-float coefficients,
+        precomputed once in estimator setup() (off the per-MLP clock). theta is
+        constant per submission, so this is pure caching: it removes 13 tiny
+        array-index ops per layer AND makes every c["..."]*array a fused
+        scalar-times-array kernel instead of the np.multiply(WhestArray)
+        auto-routing path (a Python warning-check per call, in residual wall
+        time). coeffs=None keeps the original in-graph path -- the TRAINER
+        (mirror) must keep differentiating through _coeffs_all, so that path
+        stays bit-identical.
     Returns (width,) -- or (depth, width) if all_layers -- or None if the shape
     is not covered by these params.
     """
@@ -179,10 +193,11 @@ def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=Fals
     # doubles the score multiplier. kappa4 is ~rank-1 at depth, so r4 << r.
     star = None                                   # (h2, h3, Wr, Bs) in z_l space
     rows = []
-    ca = _coeffs_all(theta)                        # all-layer coeffs, one pass
+    # coeffs (Python floats from setup) beats ca (in-graph arrays): see docstring.
+    ca = None if coeffs is not None else _coeffs_all(theta)
 
     for li in range(depth):
-        c = {k: v[li] for k, v in ca.items()}     # index (0-FLOP), no recompute
+        c = coeffs[li] if coeffs is not None else {k: v[li] for k, v in ca.items()}
         var = fnp.maximum(fnp.diag(S), 1e-8)
         s = fnp.sqrt(var)
         a = fnp.clip(m / s, -12.0, 12.0)
@@ -209,7 +224,10 @@ def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=Fals
             P4 = fnp.matmul(G2b, fnp.reshape(T4, (r4 * r4, r4 * r4)))
             k4_slice = fnp.matmul(P4, G2b.T)
             k4_diag = fnp.sum(P4 * G2b, axis=1)
-        k3_star = fnp.zeros((n, n), dtype=fnp.float32)
+        # k3_star materialized lazily: the zeros-(n,n) fallback is only ever READ
+        # by the anchor branch on layer 0, so with anchor OFF (the shipped
+        # config) no allocation happens at all.
+        k3_star = None
         if star is not None:
             h2s, h3s, Wr, Bs = star
             C3 = h2s[:, None] * Wr * Bs
@@ -230,7 +248,9 @@ def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=Fals
         # research/a1_anchor.py, whose coefficients these are.
         if anchor is not None:
             nrm3 = fnp.outer(var, s)                       # s_i^2 s_j
-            F = _anchor_feats(a, rho, k3_carried / nrm3, k3_star / nrm3, n)
+            star_n = (k3_star / nrm3 if k3_star is not None
+                      else fnp.zeros((n, n), dtype=fnp.float32))
+            F = _anchor_feats(a, rho, k3_carried / nrm3, star_n, n)
             k3_slice = k3_slice + fnp.reshape(
                 fnp.matmul(F, anchor[li]), (n, n)) * nrm3
 

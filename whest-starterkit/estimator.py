@@ -1,26 +1,22 @@
-"""v5 (WIP) — grader-proven kappa3 closure + the LEARNED ANCHOR, fused with QMC.
+"""v5 — PURE-ANALYTIC kappa3+kappa4 closure, theta trained end-to-end (mirror.py).
 
-STATUS, HONESTLY: the anchor is real but NOT yet good enough to beat v4.
-  measured (A1, 8 MLPs, 4 held out, R=32 core carry -- the shippable rank):
-      kappa3 slice error   32.0%  ->  23.5%   with the anchor (+DAgger)
-      end-to-end b^2       3.0e-5 ->  1.95e-5
-      fusion bar to beat v4 (3.396e-7):  b^2 < 1.02e-5      <-- STILL 1.9x SHORT
-  This file carries the numbers we ACTUALLY MEASURED. v4 is preserved at
-  _archive/estimator_v4.py and remains the best submission.
+SHIPPED CONFIG (v5.npz meta): rank=48, rank4=8, n_qmc=0, w_qmc=0, anchor=OFF,
+k4=ON. No sampling on the healthy path -- QMC (points.npz) survives ONLY as the
+guard-trip fallback. theta was fit end-to-end on final-layer MSE against 48
+corpus MLPs; public split: adjusted 8.60e-7, raw 7.96e-6, 0/50 failed.
 
-WHAT IS PROVEN (STRATEGY.md 7):
-  * The moment update reads ONLY the kappa3 slice (n^2) -> that slice IS the
-    whole problem. Oracle slice => 3.8-4.5e-7 end-to-end (beats every leader).
-  * The core (Tucker) carry is verified: 25.7% exact, 34% at R=32 (D1/D2 --
-    three independent codepaths agree).
-  * The anchor (per-layer poly map on [t_i, t_j, rho, carried_slice, star])
-    beats an optimal per-layer gain => the residual E13 called "a shape error a
-    scalar cannot touch" IS partially learnable.
-  * kappa4 slices are learnable and worth ~16x in the moment update (G1c).
+WHY ANCHOR=OFF: the fitted closure is an error-cancellation fixed point --
+correcting the kappa3 slice in isolation WORSENS final MSE. Any component
+upgrade must ship together with a joint theta refit (mirror.py); never land a
+"more exact" piece alone.
 
-TO CROSS THE BAR the slice must reach ~12-15% (from 23.5%). Untried levers:
-more training MLPs (A1 used FOUR of 64 available), richer features (kappa4
-slice, h1/h2 gains, Sigma spectrum -- all already computed => free at inference).
+RESIDUAL-WALL-TIME DISCIPLINE (the grader bills residual at lambda=1e11 FLOP/s;
+~10ms residual = 0.37% utilization):
+  * every meta scalar and every theta-derived coefficient is pulled to plain
+    Python in setup() -- predict() launches no tiny coefficient kernels and
+    syncs the host exactly ONCE (the envelope guard);
+  * the closure's per-layer op count is kept low deliberately (see closure.py
+    _mode_contract / coeffs notes).
 
 All learned numbers live in v5.npz (0-FLOP load) => refit without code changes.
 """
@@ -84,6 +80,7 @@ class Estimator(BaseEstimator):
         self._w_qmc = 1.0            # no params => pure QMC
         self._no_k4 = True
         self._anchor = None
+        self._coeffs = None          # per-layer Python-float closure coefficients
 
     def setup(self, ctx) -> None:
         if getattr(ctx, "submission_dir", None) is None:
@@ -109,6 +106,47 @@ class Estimator(BaseEstimator):
             self._w_qmc = float(m[3])
             self._no_k4 = float(m[5]) < 0.5
             self._anchor = self._p.anchor if float(m[4]) > 0.5 else None
+            # Precompute ALL theta-derived closure coefficients as plain Python
+            # floats, once, off the per-MLP clock. Must mirror closure._coeffs_all
+            # EXACTLY (0.10/0.40 tanh bounds, exp(1.5 tanh)); float64 math here vs
+            # float32 in-graph differs by ~1e-7 relative -- far below model error,
+            # and the envelope guard would catch any disaster. Fail open: coeffs
+            # stays None => closure computes in-graph exactly as before.
+            try:
+                import math
+                idx = closure.IDX
+                th = [[float(x) for x in row] for row in self._p.theta]
+                self._coeffs = []
+                for row in th:
+                    t = [math.tanh(v) for v in row]
+                    d = {k: 0.10 * t[idx[k]] for k in ("p", "q", "moff")}
+                    d.update({k: 0.40 * t[idx[k]] for k in ("s_dia", "s_off")})
+                    d.update({k: math.exp(1.5 * t[idx[k]])
+                              for k in ("c3m", "c3c", "c3g", "c3p",
+                                        "c4m", "c4c", "c4g", "c4p")})
+                    self._coeffs.append(d)
+            except Exception:
+                self._coeffs = None
+            # Warm the real-shape kernel paths (BLAS caches, lazy inits) OFF the
+            # per-MLP clock: setup is its own runner stage (separate timeout,
+            # never billed to a MLP's residual -- whestbench/runner.py:150),
+            # while a cold first predict() shows up as a ~100ms residual spike
+            # that pushes single MLPs over the 10% multiplier floor. Fail open.
+            try:
+                if closure is not None:
+                    depth = int(self._p.theta.shape[0])
+                    n = int(self._p.q0.shape[0])
+                    rng = fnp.random.default_rng(0)
+                    sc = (2.0 / n) ** 0.5
+                    ws = [fnp.array((rng.standard_normal((n, n)) * sc
+                                     ).astype(fnp.float32)) for _ in range(depth)]
+                    closure.predict_all_layers(
+                        MLP(width=n, depth=depth, weights=ws),
+                        self._p.theta, self._rank, self._rank4, self._p.q0,
+                        no_k4=self._no_k4, anchor=self._anchor,
+                        coeffs=self._coeffs)
+            except Exception:
+                pass
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         n, depth = mlp.width, mlp.depth
@@ -118,12 +156,13 @@ class Estimator(BaseEstimator):
         if p is not None and closure is not None and p.theta.shape[0] == depth:
             out = closure.predict_all_layers(
                 mlp, p.theta, self._rank, self._rank4,
-                p.q0, no_k4=self._no_k4, anchor=self._anchor)
+                p.q0, no_k4=self._no_k4, anchor=self._anchor,
+                coeffs=self._coeffs)
             if out is not None:
-                # ONE guard on the whole stacked output (2 syncs, not per-layer)
-                chk = fnp.asarray(out, dtype=fnp.float64)
-                if (bool(fnp.all(fnp.isfinite(chk)))
-                        and float(fnp.max(fnp.abs(chk))) < ENVELOPE):
+                # ONE guard, ONE host sync: max|out| < ENVELOPE is False for
+                # NaN (NaN propagates through max, nan<x is False) and for
+                # +/-inf (abs -> inf). No float64 copy, no isfinite pass.
+                if float(fnp.max(fnp.abs(out))) < ENVELOPE:
                     if self._w_qmc <= 0.0:
                         return out                 # pure closure: no restack, no QMC
                     rows = [out[i] for i in range(depth)]

@@ -1,8 +1,9 @@
-md5 c02e4bf7a0ecda289a7def8551a4fae3
-config rank=48 rank4=8 n_qmc=0 w_qmc=0 ANCHOR=OFF k4=ON
-theta: end-to-end fit on final-layer MSE (mirror.py, MPS), 48 corpus MLPs, R48.
-q0: random (256,48) seed (subspace-iteration start; validated benign).
-mini (100 MLPs, whest run): adjusted 8.57e-07  raw 8.54e-6  util 7.17%  0/100 failed.
-BEATS pure-QMC sampling baseline (8.76e-07). anchor OFF (oracle test: correcting
-the kappa3 slice worsens final MSE -- the closure is an error-cancellation fixed
-point; only joint theta re-tuning helps).
+md5 f063d64607d3ca3b0f527dec80741118
+config rank=48 rank4=8 n_qmc=0 w_qmc=0 ANCHOR=OFF k4=OFF
+theta: end-to-end fit on final-layer MSE (mirror.py, MPS), 48 corpus MLPs, R48, k4 OFF.
+  val (16 held-out corpus): raw median 6.63e-6, mean 7.85e-6.
+q0: random (256,48) subspace-iteration seed.
+CHANGE vs prior (k4 ON): kappa4 dropped -- measured worthless (<=1% accuracy) and
+costs ~0.9% analytical + op-count. Goal: pull grader util from ~10.9% (over floor)
+to <10% so the multiplier pins at 0.10 (deterministic, noise-free). Accuracy ~same.
+NOT yet grader-validated -- run whest run / probe-submit to confirm util<10%.
