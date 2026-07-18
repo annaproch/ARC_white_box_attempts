@@ -32,3 +32,22 @@ uv.lock
 .git-upstream/
 *.tar.gz
 IMPROVEMENTS.md
+STRATEGY.md
+CLAUDE.ai
+SKELETON_PLAN.md
+
+# Research / dev artifacts — the grader needs ONLY estimator.py, closure.py,
+# v5.npz, points.npz. Everything below is experiment scaffolding.
+_archive/
+research/
+data/
+mlp_cumulant_propagation/
+estimator_v5.py
+estimator_skeleton.py
+price_v5.py
+sweep_configs.py
+cfg_*.npz
+v5_*.npz
+v5.npz.PROVENANCE
+*.log
+*.PROVENANCE

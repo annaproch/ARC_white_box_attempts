@@ -1,5 +1,8 @@
-md5 1a72ec72afb1ec2fb7b25ada6915f58a
-config rank=32 rank4=8 n_qmc=0 w_qmc=0 ANCHOR=OFF k4=ON
-mini: raw_mse 9.17e-6  score 9.30e-7  util 10.13%  0/100 failed
-ANCHOR IS BROKEN (offline<->online feature parity). Do not enable until
-a numerical parity check passes. anchor ON measured: raw 3.47e-4.
+md5 c02e4bf7a0ecda289a7def8551a4fae3
+config rank=48 rank4=8 n_qmc=0 w_qmc=0 ANCHOR=OFF k4=ON
+theta: end-to-end fit on final-layer MSE (mirror.py, MPS), 48 corpus MLPs, R48.
+q0: random (256,48) seed (subspace-iteration start; validated benign).
+mini (100 MLPs, whest run): adjusted 8.57e-07  raw 8.54e-6  util 7.17%  0/100 failed.
+BEATS pure-QMC sampling baseline (8.76e-07). anchor OFF (oracle test: correcting
+the kappa3 slice worsens final MSE -- the closure is an error-cancellation fixed
+point; only joint theta re-tuning helps).

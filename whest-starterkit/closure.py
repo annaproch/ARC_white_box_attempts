@@ -41,6 +41,19 @@ def _coeffs(theta_row):
     }
 
 
+def _coeffs_all(theta):
+    """All-layer coefficients in ONE vectorised pass (depth,). Hoisted out of the
+    per-layer loop: this replaces depth*(tanh + 8*exp + muls) tiny ops with a
+    handful, so per layer we only INDEX (0-FLOP) instead of recompute."""
+    t = fnp.tanh(theta)                                  # (depth, 13)
+    add = {k: 0.10 * t[:, IDX[k]] for k in ("p", "q", "moff")}
+    add.update({k: 0.40 * t[:, IDX[k]] for k in ("s_dia", "s_off")})
+    mul = {k: fnp.exp(1.5 * t[:, IDX[k]])
+           for k in ("c3m", "c3c", "c3g", "c3p", "c4m", "c4c", "c4g", "c4p")}
+    add.update(mul)
+    return add
+
+
 def _top_basis(S, Q0, iters=2):
     """Top-r subspace of S by randomized subspace iteration, with a Rayleigh-Ritz
     step so the columns come out ORDERED by eigenvalue.
@@ -166,9 +179,10 @@ def predict_final_mean(mlp, theta, rank, rank4, q0, all_layers=False, no_k4=Fals
     # doubles the score multiplier. kappa4 is ~rank-1 at depth, so r4 << r.
     star = None                                   # (h2, h3, Wr, Bs) in z_l space
     rows = []
+    ca = _coeffs_all(theta)                        # all-layer coeffs, one pass
 
     for li in range(depth):
-        c = _coeffs(theta[li])
+        c = {k: v[li] for k, v in ca.items()}     # index (0-FLOP), no recompute
         var = fnp.maximum(fnp.diag(S), 1e-8)
         s = fnp.sqrt(var)
         a = fnp.clip(m / s, -12.0, 12.0)

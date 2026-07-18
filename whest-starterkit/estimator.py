@@ -77,6 +77,13 @@ class Estimator(BaseEstimator):
     def __init__(self) -> None:
         self._p = None
         self._points = None
+        # config parsed ONCE in setup() -> no per-MLP scalar syncs in predict()
+        self._rank = 0
+        self._rank4 = 8
+        self._n_qmc = 0
+        self._w_qmc = 1.0            # no params => pure QMC
+        self._no_k4 = True
+        self._anchor = None
 
     def setup(self, ctx) -> None:
         if getattr(ctx, "submission_dir", None) is None:
@@ -95,6 +102,13 @@ class Estimator(BaseEstimator):
                   f"k4={'ON' if float(m[5])>0.5 else 'OFF'} "
                   f"theta_absmax={float(fnp.max(fnp.abs(self._p.theta))):.4f}",
                   file=sys.stderr, flush=True)
+            # hoist every meta scalar sync here (once), out of predict()
+            self._rank = int(float(m[0]))
+            self._rank4 = int(float(m[1]))
+            self._n_qmc = int(float(m[2]))
+            self._w_qmc = float(m[3])
+            self._no_k4 = float(m[5]) < 0.5
+            self._anchor = self._p.anchor if float(m[4]) > 0.5 else None
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         n, depth = mlp.width, mlp.depth
@@ -102,21 +116,23 @@ class Estimator(BaseEstimator):
         rows = None
 
         if p is not None and closure is not None and p.theta.shape[0] == depth:
-            anchor = p.anchor if float(p.meta[4]) > 0.5 else None
             out = closure.predict_all_layers(
-                mlp, p.theta, int(float(p.meta[0])), int(float(p.meta[1])),
-                p.q0, no_k4=(float(p.meta[5]) < 0.5), anchor=anchor)
+                mlp, p.theta, self._rank, self._rank4,
+                p.q0, no_k4=self._no_k4, anchor=self._anchor)
             if out is not None:
+                # ONE guard on the whole stacked output (2 syncs, not per-layer)
                 chk = fnp.asarray(out, dtype=fnp.float64)
                 if (bool(fnp.all(fnp.isfinite(chk)))
                         and float(fnp.max(fnp.abs(chk))) < ENVELOPE):
-                    rows = [out[i] for i in range(depth)]      # guard passed
+                    if self._w_qmc <= 0.0:
+                        return out                 # pure closure: no restack, no QMC
+                    rows = [out[i] for i in range(depth)]
 
         if rows is None:                    # guard tripped / no params => QMC only
             rows = [fnp.zeros(n, dtype=fnp.float32) for _ in range(depth)]
             w_qmc = 1.0
         else:
-            w_qmc = float(p.meta[3])
+            w_qmc = self._w_qmc
 
         # QMC on the remaining floor, fused at every layer. w_qmc is fitted
         # OFFLINE on held-out MLPs against SCORE, so a weak closure drives
@@ -126,8 +142,7 @@ class Estimator(BaseEstimator):
             # cap: on a guard trip (w_qmc==1, closure unusable) FILL THE FLOOR --
             # the n_qmc knob only throttles fusion on healthy MLPs, it must never
             # starve the emergency fallback down to a single sample (n_qmc=0 -> k=1).
-            n_qmc = int(float(p.meta[2])) if p is not None else pts.shape[0]
-            cap = pts.shape[0] if w_qmc >= 1.0 else n_qmc
+            cap = pts.shape[0] if w_qmc >= 1.0 else self._n_qmc
             per = depth * (2 * n * n + 2 * n)
             k = max(min(int(0.062 * budget / per), pts.shape[0], cap), 1)
             x = pts[:k]
