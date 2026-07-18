@@ -122,10 +122,14 @@ class Estimator(BaseEstimator):
         # OFFLINE on held-out MLPs against SCORE, so a weak closure drives
         # w_qmc -> 1 and we degrade to pure QMC, never below it.
         pts = self._points
-        if pts is not None and pts.shape[1] == n:
-            n_qmc = int(float(p.meta[2])) if p is not None else 6400
+        if pts is not None and pts.shape[1] == n and w_qmc > 0.0:
+            # cap: on a guard trip (w_qmc==1, closure unusable) FILL THE FLOOR --
+            # the n_qmc knob only throttles fusion on healthy MLPs, it must never
+            # starve the emergency fallback down to a single sample (n_qmc=0 -> k=1).
+            n_qmc = int(float(p.meta[2])) if p is not None else pts.shape[0]
+            cap = pts.shape[0] if w_qmc >= 1.0 else n_qmc
             per = depth * (2 * n * n + 2 * n)
-            k = max(min(int(0.062 * budget / per), pts.shape[0], n_qmc), 1)
+            k = max(min(int(0.062 * budget / per), pts.shape[0], cap), 1)
             x = pts[:k]
             mc = []
             for w in mlp.weights:
