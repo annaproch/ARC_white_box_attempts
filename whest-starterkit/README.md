@@ -1,3 +1,9 @@
+> This directory contains a modified research estimator. Start with the
+> [project overview and experiment summary](../README.md) for the current approach,
+> artifact configuration, and reproduction limits. The upstream starter-kit
+> walkthrough below is retained for reference; its standalone-demo and single-file
+> packaging instructions do not fully describe the modified estimator.
+
 <div align="center">
   <img src="assets/logo/logo.png" alt="ARC WhiteBox Estimation Challenge 2026 logo" style="height: 120px;">
 </div>

@@ -1,5 +1,10 @@
 # Research scripts
 
+This is the early experiment index; its "shipped" descriptions below refer to
+historical v3/v4 artifacts. For the current analytical estimator, Tucker/CP
+experiments, learned corrections, and reproduction limits, see the
+[project README](../README.md).
+
 Experiments behind IMPROVEMENTS.md (all at the phase-1 shape: width 256,
 depth 32, He init, no bias). Run from the `mlp_cumulant_propagation` repo so
 its venv (torch + mlp_kprop) resolves:

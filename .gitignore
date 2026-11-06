@@ -18,6 +18,14 @@ __pycache__/
 .DS_Store
 whest-starterkit/.git-upstream/
 
+# local credentials (never publish)
+.env
+.env.*
+*.pem
+*.key
+.netrc
+.pypirc
+
 # sampled moment corpus (large, regenerable)
 data/
 
